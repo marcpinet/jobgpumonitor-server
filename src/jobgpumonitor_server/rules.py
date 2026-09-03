@@ -112,7 +112,11 @@ def evaluate(run: Dict[str, Any], changes: List[str], cfg: AlertsConfig, sent: O
 
     if ("ended" in changes or "scheduler_ended" in changes) and cfg.finished:
         status = run.get("status") or "unknown"
-        if "finished" not in sent:
+        # A job may run several programs one after the other: when a scheduler probe follows
+        # this job, wait for its terminal verdict instead of concluding on the first run.end
+        # (evaluate_periodic sends the alert anyway if the probe stays silent too long).
+        waiting_for_scheduler = run.get("scheduler_state") and not run.get("scheduler_terminal") and "scheduler_ended" not in changes
+        if "finished" not in sent and not waiting_for_scheduler:
             out.append(_finished_alert(run, name, status))
             run["notified_status"] = status
         elif "scheduler_ended" in changes and run.get("notified_status") not in (None, status) and status in BAD_STATUSES:
@@ -177,10 +181,17 @@ def evaluate_periodic(run: Dict[str, Any], cfg: AlertsConfig, sent: Optional[set
     sent = sent or set()
     now = now or time.time()
     out: List[Alert] = []
-    if run.get("phase") != "running":
-        return out
     name = display_name(run)
     rid = run["run_id"]
+    if run.get("phase") == "ended":
+        # finished alert deferred while waiting for the scheduler's verdict: give up after a while
+        if cfg.finished and "finished" not in sent and not run.get("scheduler_terminal") and now - (run.get("end_ts") or now) > cfg.finished_grace_s:
+            status = run.get("status") or "unknown"
+            out.append(_finished_alert(run, name, status))
+            run["notified_status"] = status
+        return out
+    if run.get("phase") != "running":
+        return out
 
     hb = run.get("last_heartbeat_ts")
     if hb and "stalled" not in sent and not run.get("scheduler_terminal"):

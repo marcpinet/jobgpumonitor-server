@@ -59,13 +59,14 @@ class Engine:
             alerts = evaluate(run, changes, self.cfg.alerts, sent)
             self.store.upsert_run(run)
             self._notify(run, alerts)
-        # time-based rules on everything active (cached or not)
-        for run in self.store.active_runs():
+        # time-based rules on active runs, plus recently ended ones still waiting for the scheduler
+        for run in self.store.active_runs() + self.store.list_runs(phase="ended", limit=50):
             run = self._run(run["run_id"])
             sent = self.store.alert_keys(run["run_id"])
             alerts = evaluate_periodic(run, self.cfg.alerts, sent, now)
             if alerts:
                 self._notify(run, alerts)
+                self.store.upsert_run(run)
         # forget ended runs from the cache, prune old events daily
         for rid in [r for r, doc in self._cache.items() if doc.get("phase") == "ended" and now - (doc.get("updated_ts") or now) > 600]:
             del self._cache[rid]

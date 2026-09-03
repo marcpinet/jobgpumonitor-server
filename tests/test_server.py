@@ -55,6 +55,15 @@ def write_events(base: Path, run_id: str, fname: str, events):
 # --------------------------------------------------------------------------- model
 
 
+def test_iso_to_ts_is_utc_and_dst_safe():
+    from jobgpumonitor_server.model import iso_to_ts
+
+    assert iso_to_ts("1970-01-01T00:00:00.000Z") == 0.0
+    assert iso_to_ts("2026-07-01T12:00:00.500Z") == 1782907200.5  # summer: no DST drift
+    assert iso_to_ts("2026-01-01T12:00:00Z") == 1767268800.0
+    assert iso_to_ts("garbage") is None and iso_to_ts(None) is None
+
+
 def test_model_process_lifecycle():
     run = new_run("c/1/0")
     ch = apply(run, env("run.start", {"scheduler": {"name": "slurm", "job_id": "1", "job_name": "tsad", "partition": "All"},
@@ -122,6 +131,27 @@ def test_rules_started_finished_and_correction():
     assert len(a) == 1 and a[0].key == "finished_correction" and "out of memory" in a[0].body
     # same verdict again: nothing
     assert evaluate(run, ["scheduler_ended"], cfg, sent={"started", "finished", "finished_correction"}) == []
+
+
+def test_finished_waits_for_scheduler_verdict_when_probe_is_present():
+    cfg = AlertsConfig()
+    run = new_run("c/1/0")
+    run.update(job_name="tsad", phase="ended", status="ok", scheduler_state="RUNNING", scheduler_terminal=False, end_ts=1000.0)
+    assert evaluate(run, ["ended"], cfg) == []  # first program ended, job still RUNNING for Slurm
+    run.update(status="error", exception={"type": "RuntimeError", "message": "x"})
+    assert evaluate(run, ["ended"], cfg) == []  # second program crashed, still no verdict
+    run.update(scheduler_state="COMPLETED", scheduler_terminal=True)
+    a = evaluate(run, ["scheduler_ended"], cfg)
+    assert [x.key for x in a] == ["finished"] and a[0].level == "error"  # one alert, the right one
+    # probe never answers: periodic fallback after the grace period
+    run2 = new_run("c/2/0")
+    run2.update(job_name="t", phase="ended", status="ok", scheduler_state="RUNNING", scheduler_terminal=False, end_ts=1000.0)
+    assert evaluate_periodic(run2, cfg, now=1000.0 + 60) == []
+    assert [x.key for x in evaluate_periodic(run2, cfg, now=1000.0 + 700)] == ["finished"]
+    # no probe at all: run.end concludes immediately
+    run3 = new_run("c/3/0")
+    run3.update(job_name="t", phase="ended", status="ok")
+    assert [x.key for x in evaluate(run3, ["ended"], cfg)] == ["finished"]
 
 
 def test_rules_success_body_and_warnings():

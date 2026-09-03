@@ -7,6 +7,7 @@ of *changes* worth reacting to: ``started``, ``ended``, ``scheduler_ended``, ``h
 
 from __future__ import annotations
 
+import calendar
 import time
 from typing import Any, Dict, List, Optional
 
@@ -19,11 +20,12 @@ BAD_STATUSES = {"error", "timeout", "oom", "cancelled", "preempted", "node_fail"
 
 
 def iso_to_ts(s: Optional[str]) -> Optional[float]:
+    """``2026-09-03T12:59:00.123Z`` (UTC, as emitted) -> epoch seconds. DST-safe (timegm, not mktime)."""
     if not s:
         return None
     try:
         base, _, frac = s.rstrip("Z").partition(".")
-        t = time.mktime(time.strptime(base, "%Y-%m-%dT%H:%M:%S")) - time.timezone
+        t = calendar.timegm(time.strptime(base, "%Y-%m-%dT%H:%M:%S"))
         return t + (float("0." + frac) if frac else 0.0)
     except ValueError:
         return None

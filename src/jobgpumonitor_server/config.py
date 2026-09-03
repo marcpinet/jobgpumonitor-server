@@ -22,6 +22,7 @@ stalled_after_s = 0                 # 0 = 3 x the emitter heartbeat interval
 gpu_idle_min = 15                   # warn when every visible GPU stays < 5 % for this many minutes (0 = off)
 mem_pct = 90                        # warn above this share of the memory limit (0 = off)
 will_timeout = true                 # warn when the tqdm ETA overshoots the job deadline
+finished_grace_s = 600              # with a scheduler probe, wait up to this long for Slurm's verdict before "finished"
 quiet_hours = ""                    # e.g. "23-7" to hold non-critical alerts (local time)
 
 # ---- notification channels: fill at least one ----
@@ -59,6 +60,7 @@ class AlertsConfig:
     gpu_idle_min: float = 15.0
     mem_pct: float = 90.0
     will_timeout: bool = True
+    finished_grace_s: float = 600.0
     quiet_hours: str = ""
 
 
