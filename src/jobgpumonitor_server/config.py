@@ -46,6 +46,7 @@ enabled = true                      # also print alerts on the console
 host = "127.0.0.1"
 port = 21834
 token = ""                          # bearer token required when set
+prefix = ""                         # serve under a sub-path, e.g. "/jgm" behind https://host/jgm/
 """
 
 
@@ -71,6 +72,7 @@ class Config:
     api_host: str = "127.0.0.1"
     api_port: int = 21834
     api_token: str = ""
+    api_prefix: str = ""
     path: Optional[str] = None
 
 
@@ -110,6 +112,7 @@ def load_config(path: Optional[str] = None, env: Optional[Dict[str, str]] = None
         cfg.api_host = api.get("host", cfg.api_host)
         cfg.api_port = int(api.get("port", cfg.api_port))
         cfg.api_token = api.get("token", "")
+        cfg.api_prefix = api.get("prefix", "")
     # environment overrides
     if env.get("JGMD_DIRS"):
         cfg.dirs = [os.path.expanduser(d) for d in env["JGMD_DIRS"].split(",") if d.strip()]
@@ -129,5 +132,7 @@ def load_config(path: Optional[str] = None, env: Optional[Dict[str, str]] = None
         cfg.notify.setdefault("webhook", {})["url"] = env["JGMD_WEBHOOK_URL"]
     if env.get("JGMD_API_TOKEN"):
         cfg.api_token = env["JGMD_API_TOKEN"]
+    if env.get("JGMD_API_PREFIX"):
+        cfg.api_prefix = env["JGMD_API_PREFIX"]
     cfg.poll_s = max(1.0, cfg.poll_s)
     return cfg

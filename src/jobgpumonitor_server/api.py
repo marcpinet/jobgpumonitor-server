@@ -17,7 +17,21 @@ from typing import Any, Dict, List, Optional
 from .store import Store
 
 
-def create_app(store: Store, token: str = "") -> Any:
+def create_app(store: Store, token: str = "", prefix: str = "") -> Any:
+    """Build the app. With ``prefix`` (e.g. ``/jgm``) every route is served under that path,
+    which lets a reverse proxy expose the API as a sub-path of an existing host."""
+    app = _build_app(store, token)
+    prefix = "/" + prefix.strip("/") if prefix and prefix.strip("/") else ""
+    if not prefix:
+        return app
+    from fastapi import FastAPI
+
+    outer = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    outer.mount(prefix, app)
+    return outer
+
+
+def _build_app(store: Store, token: str = "") -> Any:
     try:
         from fastapi import Depends, FastAPI, HTTPException, Query, Request
         from fastapi.responses import StreamingResponse
@@ -33,7 +47,7 @@ def create_app(store: Store, token: str = "") -> Any:
         if not hmac.compare_digest(got.encode(), f"Bearer {token}".encode()):
             raise HTTPException(status_code=401, detail="bad token", headers={"WWW-Authenticate": "Bearer"})
 
-    @app.get("/health")
+    @app.api_route("/health", methods=["GET", "HEAD"])
     def health() -> Dict[str, Any]:
         return {"ok": True, "ts": time.time(), "active": len(store.active_runs())}
 
@@ -74,7 +88,7 @@ def create_app(store: Store, token: str = "") -> Any:
     return app
 
 
-def serve_api(store: Store, host: str, port: int, token: str = "") -> None:  # pragma: no cover
+def serve_api(store: Store, host: str, port: int, token: str = "", prefix: str = "") -> None:  # pragma: no cover
     import uvicorn
 
-    uvicorn.run(create_app(store, token), host=host, port=port, log_level="warning")
+    uvicorn.run(create_app(store, token, prefix), host=host, port=port, log_level="warning")

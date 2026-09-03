@@ -291,5 +291,13 @@ def test_api_endpoints(tmp_path):
     assert client.get("/runs/c/1/0", headers=h).json()["phase"] == "running"
     assert client.get("/runs/c/1/0/events", headers=h).json()[0]["type"] == "run.heartbeat"
     assert client.get("/runs/nope/1/0", headers=h).status_code == 404
+    assert client.head("/health").status_code == 200
+    # served under a prefix behind a reverse proxy sub-path
+    sub = TestClient(create_app(store, token="s3cret", prefix="/jgm"))
+    assert sub.get("/health").status_code == 404
+    assert sub.get("/jgm/health").json()["ok"] is True
+    assert sub.get("/jgm/runs", headers=h).json()[0]["job_name"] == "tsad"
+    assert sub.get("/jgm/runs/c/1/0", headers=h).json()["phase"] == "running"
+    assert sub.get("/jgm/docs").status_code == 200 and "/jgm/openapi.json" in sub.get("/jgm/docs").text
     t0 = time.time()
     assert time.time() - t0 < 5

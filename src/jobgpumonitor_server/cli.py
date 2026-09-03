@@ -57,8 +57,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         t = threading.Thread(target=engine.run_forever, args=(stop,), name="jgmd-engine", daemon=True)
         t.start()
-        print(f"API on http://{cfg.api_host}:{cfg.api_port}  (docs at /docs)", file=sys.stderr)
-        serve_api(engine.store, cfg.api_host, cfg.api_port, cfg.api_token)
+        pre = "/" + cfg.api_prefix.strip("/") if cfg.api_prefix.strip("/") else ""
+        print(f"API on http://{cfg.api_host}:{cfg.api_port}{pre}  (docs at {pre}/docs)", file=sys.stderr)
+        serve_api(engine.store, cfg.api_host, cfg.api_port, cfg.api_token, cfg.api_prefix)
         stop.set()
         return 0
     engine.run_forever(stop)
