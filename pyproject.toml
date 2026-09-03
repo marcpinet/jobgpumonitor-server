@@ -16,7 +16,7 @@ dependencies = []
 [project.optional-dependencies]
 toml = ["tomli>=2; python_version < '3.11'"]
 api = ["fastapi>=0.110", "uvicorn>=0.27"]
-dev = ["pytest>=8", "ruff>=0.6", "jobgpumonitor", "httpx>=0.27", "fastapi>=0.110", "tomli>=2; python_version < '3.11'"]
+dev = ["pytest>=8", "ruff>=0.6", "jobgpumonitor>=0.1.0", "httpx>=0.27", "fastapi>=0.110", "tomli>=2; python_version < '3.11'"]
 
 [project.scripts]
 jgmd = "jobgpumonitor_server.cli:main"
@@ -40,5 +40,3 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501", "UP006", "UP035", "UP007", "UP045", "B008"]
 
-[tool.uv.sources]
-jobgpumonitor = { path = "../jobgpumonitor", editable = true }

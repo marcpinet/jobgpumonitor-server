@@ -11,13 +11,9 @@ jobs:
         python: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: marcpinet/jobgpumonitor
-          path: jobgpumonitor
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - run: pip install ruff && ruff check src tests
-      - run: pip install -e ./jobgpumonitor && pip install -e ".[dev]" --no-deps && pip install pytest httpx fastapi "tomli; python_version < '3.11'"
+      - run: pip install -e ".[dev]"
       - run: pytest -q -p no:warnings
