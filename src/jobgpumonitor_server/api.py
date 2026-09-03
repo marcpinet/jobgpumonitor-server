@@ -6,21 +6,50 @@
     GET /runs/{run_id}/events?after=0&limit=1000&types=run.heartbeat,metric.log
     GET /runs/{run_id}/stream          server-sent events, new events as they are ingested
     GET /alerts?limit=100
+    POST /ingest                       JSON list of events (gzip ok), bearer = ingest_token
 """
 
 import asyncio
+import gzip
 import hmac
 import json
+import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
 from .store import Store
 
 
-def create_app(store: Store, token: str = "", prefix: str = "") -> Any:
+def append_events(base_dir: str, events: List[Any]) -> "tuple[int, int]":
+    """Append well-formed events to ``<base_dir>/runs/<run_id>/<emitter>.jsonl``. Returns (accepted, rejected)."""
+    accepted = rejected = 0
+    handles: Dict[str, Any] = {}
+    try:
+        for ev in events:
+            if not (isinstance(ev, dict) and isinstance(ev.get("run_id"), str) and isinstance(ev.get("emitter"), str)
+                    and isinstance(ev.get("type"), str) and isinstance(ev.get("data"), dict)
+                    and _RUN_ID_RE.match(ev["run_id"]) and _EMITTER_RE.match(ev["emitter"])):
+                rejected += 1
+                continue
+            path = os.path.join(base_dir, "runs", *ev["run_id"].split("/"), ev["emitter"] + ".jsonl")
+            fh = handles.get(path)
+            if fh is None:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                fh = handles[path] = open(path, "a", encoding="utf-8")
+            fh.write(json.dumps(ev, separators=(",", ":"), ensure_ascii=False) + "\n")
+            accepted += 1
+    finally:
+        for fh in handles.values():
+            fh.flush()
+            fh.close()
+    return accepted, rejected
+
+
+def create_app(store: Store, token: str = "", prefix: str = "", ingest_token: str = "", ingest_dir: str = "") -> Any:
     """Build the app. With ``prefix`` (e.g. ``/jgm``) every route is served under that path,
     which lets a reverse proxy expose the API as a sub-path of an existing host."""
-    app = _build_app(store, token)
+    app = _build_app(store, token, ingest_token, ingest_dir)
     prefix = "/" + prefix.strip("/") if prefix and prefix.strip("/") else ""
     if not prefix:
         return app
@@ -31,7 +60,12 @@ def create_app(store: Store, token: str = "", prefix: str = "") -> Any:
     return outer
 
 
-def _build_app(store: Store, token: str = "") -> Any:
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[0-9]+$")
+_EMITTER_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+_MAX_BODY = 32 * 1024 * 1024
+
+
+def _build_app(store: Store, token: str = "", ingest_token: str = "", ingest_dir: str = "") -> Any:
     try:
         from fastapi import Depends, FastAPI, HTTPException, Query, Request
         from fastapi.responses import StreamingResponse
@@ -46,6 +80,34 @@ def _build_app(store: Store, token: str = "") -> Any:
         got = request.headers.get("authorization") or ""
         if not hmac.compare_digest(got.encode(), f"Bearer {token}".encode()):
             raise HTTPException(status_code=401, detail="bad token", headers={"WWW-Authenticate": "Bearer"})
+
+    async def ingest_auth(request: Request) -> None:
+        if not ingest_token:
+            raise HTTPException(status_code=503, detail="ingest disabled: set [api] ingest_token")
+        got = request.headers.get("authorization") or ""
+        if not hmac.compare_digest(got.encode(), f"Bearer {ingest_token}".encode()):
+            raise HTTPException(status_code=401, detail="bad ingest token", headers={"WWW-Authenticate": "Bearer"})
+
+    @app.post("/ingest", dependencies=[Depends(ingest_auth)])
+    async def ingest(request: Request) -> Dict[str, Any]:
+        """Accept a JSON list of events (optionally gzip-encoded) and append them to the local
+        event directory, where the engine picks them up exactly like locally written files."""
+        raw = await request.body()
+        if len(raw) > _MAX_BODY:
+            raise HTTPException(status_code=413, detail="body too large")
+        if request.headers.get("content-encoding", "").lower() == "gzip":
+            try:
+                raw = gzip.decompress(raw)
+            except (OSError, EOFError) as e:
+                raise HTTPException(status_code=400, detail="bad gzip") from e
+        try:
+            events = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise HTTPException(status_code=400, detail="body must be a JSON list of events") from e
+        if not isinstance(events, list):
+            raise HTTPException(status_code=400, detail="body must be a JSON list of events")
+        accepted, rejected = append_events(ingest_dir, events)
+        return {"accepted": accepted, "rejected": rejected}
 
     @app.api_route("/health", methods=["GET", "HEAD"])
     def health() -> Dict[str, Any]:
@@ -88,7 +150,7 @@ def _build_app(store: Store, token: str = "") -> Any:
     return app
 
 
-def serve_api(store: Store, host: str, port: int, token: str = "", prefix: str = "") -> None:  # pragma: no cover
+def serve_api(store: Store, host: str, port: int, token: str = "", prefix: str = "", ingest_token: str = "", ingest_dir: str = "") -> None:  # pragma: no cover
     import uvicorn
 
-    uvicorn.run(create_app(store, token, prefix), host=host, port=port, log_level="warning")
+    uvicorn.run(create_app(store, token, prefix, ingest_token, ingest_dir), host=host, port=port, log_level="warning")

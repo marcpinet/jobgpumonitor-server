@@ -301,3 +301,33 @@ def test_api_endpoints(tmp_path):
     assert sub.get("/jgm/docs").status_code == 200 and "/jgm/openapi.json" in sub.get("/jgm/docs").text
     t0 = time.time()
     assert time.time() - t0 < 5
+
+
+def test_ingest_endpoint_writes_files_engine_reads_them(tmp_path):
+    pytest.importorskip("fastapi")
+    import gzip
+
+    from fastapi.testclient import TestClient
+
+    from jobgpumonitor_server.api import create_app
+
+    base = tmp_path / "ev"
+    store = Store(":memory:")
+    client = TestClient(create_app(store, token="read", ingest_token="write", ingest_dir=str(base)))
+    ev1 = env("run.start", {"scheduler": {"name": "slurm", "job_id": "5"}, "host": "n", "start_ts": 1.0}, run_id="k/5/0", emitter="process-r0-n-9", pid=9)
+    ev2 = env("run.end", {"status": "ok", "exit_code": 0}, run_id="k/5/0", emitter="process-r0-n-9", pid=9, seq=1)
+    bad = {"run_id": "../../etc", "emitter": "x", "type": "t", "data": {}}
+    assert client.post("/ingest", json=[ev1]).status_code == 401
+    assert client.post("/ingest", json=[ev1], headers={"Authorization": "Bearer read"}).status_code == 401
+    r = client.post("/ingest", json=[ev1, bad], headers={"Authorization": "Bearer write"})
+    assert r.status_code == 200 and r.json() == {"accepted": 1, "rejected": 1}
+    body = gzip.compress(json.dumps([ev2]).encode())
+    r = client.post("/ingest", content=body, headers={"Authorization": "Bearer write", "Content-Encoding": "gzip", "Content-Type": "application/json"})
+    assert r.json()["accepted"] == 1
+    assert (base / "runs" / "k" / "5" / "0" / "process-r0-n-9.jsonl").read_text().count("\n") == 2
+    eng = Engine(Config(dirs=[str(base)], db=":memory:"), store=store, notifiers=[])
+    eng.cycle()
+    assert store.get_run("k/5/0")["status"] == "ok"
+    # no ingest token configured -> 503, never silently open
+    closed = TestClient(create_app(store, token="read", ingest_dir=str(base)))
+    assert closed.post("/ingest", json=[ev1], headers={"Authorization": "Bearer write"}).status_code == 503

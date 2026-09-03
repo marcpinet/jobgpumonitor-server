@@ -47,6 +47,7 @@ host = "127.0.0.1"
 port = 21834
 token = ""                          # bearer token required when set
 prefix = ""                         # serve under a sub-path, e.g. "/jgm" behind https://host/jgm/
+ingest_token = ""                   # separate write token used by `jgm forward` on the cluster (POST /ingest)
 """
 
 
@@ -73,6 +74,7 @@ class Config:
     api_port: int = 21834
     api_token: str = ""
     api_prefix: str = ""
+    ingest_token: str = ""
     path: Optional[str] = None
 
 
@@ -113,6 +115,7 @@ def load_config(path: Optional[str] = None, env: Optional[Dict[str, str]] = None
         cfg.api_port = int(api.get("port", cfg.api_port))
         cfg.api_token = api.get("token", "")
         cfg.api_prefix = api.get("prefix", "")
+        cfg.ingest_token = api.get("ingest_token", "")
     # environment overrides
     if env.get("JGMD_DIRS"):
         cfg.dirs = [os.path.expanduser(d) for d in env["JGMD_DIRS"].split(",") if d.strip()]
@@ -134,5 +137,7 @@ def load_config(path: Optional[str] = None, env: Optional[Dict[str, str]] = None
         cfg.api_token = env["JGMD_API_TOKEN"]
     if env.get("JGMD_API_PREFIX"):
         cfg.api_prefix = env["JGMD_API_PREFIX"]
+    if env.get("JGMD_INGEST_TOKEN"):
+        cfg.ingest_token = env["JGMD_INGEST_TOKEN"]
     cfg.poll_s = max(1.0, cfg.poll_s)
     return cfg

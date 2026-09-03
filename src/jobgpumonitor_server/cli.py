@@ -59,7 +59,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         t.start()
         pre = "/" + cfg.api_prefix.strip("/") if cfg.api_prefix.strip("/") else ""
         print(f"API on http://{cfg.api_host}:{cfg.api_port}{pre}  (docs at {pre}/docs)", file=sys.stderr)
-        serve_api(engine.store, cfg.api_host, cfg.api_port, cfg.api_token, cfg.api_prefix)
+        serve_api(engine.store, cfg.api_host, cfg.api_port, cfg.api_token, cfg.api_prefix, cfg.ingest_token, cfg.dirs[0])
         stop.set()
         return 0
     engine.run_forever(stop)
