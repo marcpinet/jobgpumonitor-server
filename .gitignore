@@ -10,3 +10,5 @@ build/
 *.service
 *.db
 *.sqlite*
+update.bat
+!deploy/*.service

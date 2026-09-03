@@ -1,0 +1,15 @@
+[Unit]
+Description=jobgpumonitor server (run state, alerts, API)
+After=network.target
+
+[Service]
+User=USER
+Type=simple
+WorkingDirectory=/home/USER/jobgpumonitor-server/
+ExecStart=/home/USER/jobgpumonitor-server/.venv/bin/jgmd serve --api
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
