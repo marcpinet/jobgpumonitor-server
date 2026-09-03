@@ -1,0 +1,76 @@
+"""Read-only HTTP API over the store (optional: ``pip install "jobgpumonitor-server[api]"``).
+
+    GET /health
+    GET /runs?phase=running&cluster=…&limit=100
+    GET /runs/{run_id}                 (run_id contains slashes: /runs/marcel-c3/8224458/0)
+    GET /runs/{run_id}/events?after=0&limit=1000&types=run.heartbeat,metric.log
+    GET /runs/{run_id}/stream          server-sent events, new events as they are ingested
+    GET /alerts?limit=100
+"""
+
+import asyncio
+import json
+import time
+from typing import Any, Dict, List, Optional
+
+from .store import Store
+
+
+def create_app(store: Store, token: str = "") -> Any:
+    try:
+        from fastapi import Depends, FastAPI, HTTPException, Query, Request
+        from fastapi.responses import StreamingResponse
+    except ImportError as e:  # pragma: no cover
+        raise SystemExit('the API needs fastapi and uvicorn: pip install "jobgpumonitor-server[api]"') from e
+
+    app = FastAPI(title="jobgpumonitor-server", version="0.1.0")
+
+    async def auth(request: Request) -> None:
+        if token and request.headers.get("authorization") != f"Bearer {token}":
+            raise HTTPException(status_code=401, detail="bad token")
+
+    @app.get("/health")
+    def health() -> Dict[str, Any]:
+        return {"ok": True, "ts": time.time(), "active": len(store.active_runs())}
+
+    @app.get("/runs", dependencies=[Depends(auth)])
+    def runs(phase: Optional[str] = None, cluster: Optional[str] = None, limit: int = Query(100, le=1000)) -> List[Dict[str, Any]]:
+        return store.list_runs(phase=phase, limit=limit, cluster=cluster)
+
+    @app.get("/alerts", dependencies=[Depends(auth)])
+    def alerts(limit: int = Query(100, le=1000), run_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        return store.list_alerts(limit=limit, run_id=run_id)
+
+    @app.get("/runs/{run_id:path}/events", dependencies=[Depends(auth)])
+    def events(run_id: str, after: int = 0, limit: int = Query(1000, le=10000), types: Optional[str] = None) -> List[Dict[str, Any]]:
+        return store.events(run_id, after_id=after, limit=limit, types=types.split(",") if types else None)
+
+    @app.get("/runs/{run_id:path}/stream", dependencies=[Depends(auth)])
+    async def stream(run_id: str, after: int = 0) -> Any:
+        async def gen():
+            last = after
+            while True:
+                batch = store.events(run_id, after_id=last, limit=500)
+                for e in batch:
+                    last = e["_id"]
+                    yield f"id: {last}\nevent: {e['type']}\ndata: {json.dumps(e, separators=(',', ':'))}\n\n"
+                if not batch:
+                    yield ": keepalive\n\n"
+                    await asyncio.sleep(2)
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    @app.get("/runs/{run_id:path}", dependencies=[Depends(auth)])
+    def run(run_id: str) -> Dict[str, Any]:
+        doc = store.get_run(run_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        return doc
+
+    return app
+
+
+def serve_api(store: Store, host: str, port: int, token: str = "") -> None:  # pragma: no cover
+    import uvicorn
+
+    uvicorn.run(create_app(store, token), host=host, port=port, log_level="warning")
