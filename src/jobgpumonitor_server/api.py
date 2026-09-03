@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import hmac
 import json
 import time
 from typing import Any, Dict, List, Optional
@@ -26,8 +27,11 @@ def create_app(store: Store, token: str = "") -> Any:
     app = FastAPI(title="jobgpumonitor-server", version="0.1.0")
 
     async def auth(request: Request) -> None:
-        if token and request.headers.get("authorization") != f"Bearer {token}":
-            raise HTTPException(status_code=401, detail="bad token")
+        if not token:
+            return
+        got = request.headers.get("authorization") or ""
+        if not hmac.compare_digest(got.encode(), f"Bearer {token}".encode()):
+            raise HTTPException(status_code=401, detail="bad token", headers={"WWW-Authenticate": "Bearer"})
 
     @app.get("/health")
     def health() -> Dict[str, Any]:
