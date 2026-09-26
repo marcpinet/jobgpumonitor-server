@@ -394,3 +394,19 @@ def test_log_chunks_rebuild_files_and_are_served(tmp_path):
     r = client.get("/runs/c/9/0/logs?stream=stdout&tail=8", headers=h).json()
     assert r["text"] == "epoch 2\n" and r["head_cut"] is True
     assert client.get("/runs/c/9/0/logs?stream=nope", headers=h).status_code == 404
+
+
+def test_next_program_in_the_same_job_reopens_the_run():
+    run = new_run("c/1/0")
+    apply(run, sched("RUNNING", active=True))
+    apply(run, env("run.start", {"scheduler": {"name": "slurm"}, "host": "h", "start_ts": 1.0}, emitter="process-r0-h-1", pid=1))
+    apply(run, env("run.end", {"status": "ok", "exit_code": 0, "duration_s": 5}, emitter="process-r0-h-1", pid=1, seq=1))
+    assert run["phase"] == "ended" and run["status"] == "ok"
+    ch = apply(run, env("run.start", {"scheduler": {"name": "slurm"}, "host": "h", "start_ts": 7.0}, emitter="process-r0-h-2", pid=2))
+    assert ch == [] and run["phase"] == "running" and run["status"] is None and run["duration_s"] is None
+    apply(run, env("run.end", {"status": "error", "exit_code": 1, "duration_s": 3}, emitter="process-r0-h-2", pid=2, seq=1))
+    assert run["phase"] == "ended" and run["status"] == "error"
+    # once the scheduler says it is over, a late run.start cannot reopen it
+    apply(run, sched("FAILED", terminal=True, exit_code=1))
+    apply(run, env("run.start", {"scheduler": {"name": "slurm"}, "host": "h", "start_ts": 9.0}, emitter="process-r0-h-3", pid=3))
+    assert run["phase"] == "ended" and run["status"] == "error"

@@ -117,6 +117,16 @@ def apply(run: Dict[str, Any], env: Dict[str, Any]) -> List[str]:
             if run["phase"] != "running":
                 changes.append("started")
             run["phase"] = "running"
+        elif not run.get("scheduler_terminal"):
+            # a job runs several programs one after the other (``a && b``): the next one
+            # starts after the previous ``run.end``, the allocation is still alive
+            run["phase"] = "running"
+            run["status"] = None
+            run["status_source"] = None
+            run["end_ts"] = None
+            run["duration_s"] = None
+            run["exception"] = None
+            run["stderr_tail"] = None
 
     elif etype == "run.heartbeat":
         if primary or not run.get("last_heartbeat_ts") or ts > run["last_heartbeat_ts"]:
