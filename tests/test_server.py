@@ -400,11 +400,11 @@ def test_next_program_in_the_same_job_reopens_the_run():
     run = new_run("c/1/0")
     apply(run, sched("RUNNING", active=True))
     apply(run, env("run.start", {"scheduler": {"name": "slurm"}, "host": "h", "start_ts": 1.0}, emitter="process-r0-h-1", pid=1))
-    apply(run, env("run.end", {"status": "ok", "exit_code": 0, "duration_s": 5}, emitter="process-r0-h-1", pid=1, seq=1))
+    apply(run, env("run.end", {"status": "ok", "exit_code": 0, "duration_s": 5, "end_ts": 6.0}, emitter="process-r0-h-1", pid=1, seq=1))
     assert run["phase"] == "ended" and run["status"] == "ok"
     ch = apply(run, env("run.start", {"scheduler": {"name": "slurm"}, "host": "h", "start_ts": 7.0}, emitter="process-r0-h-2", pid=2))
     assert ch == [] and run["phase"] == "running" and run["status"] is None and run["duration_s"] is None
-    apply(run, env("run.end", {"status": "error", "exit_code": 1, "duration_s": 3}, emitter="process-r0-h-2", pid=2, seq=1))
+    apply(run, env("run.end", {"status": "error", "exit_code": 1, "duration_s": 3, "end_ts": 10.0}, emitter="process-r0-h-2", pid=2, seq=1))
     assert run["phase"] == "ended" and run["status"] == "error"
     # once the scheduler says it is over, a late run.start cannot reopen it
     apply(run, sched("FAILED", terminal=True, exit_code=1))
@@ -419,3 +419,17 @@ def test_log_stream_owned_by_first_emitter():
     assert store.append_log("c/1/0", {"stream": "stdout", "text": "b\n"}, "wrapper-r0-h-1") is True
     assert store.append_log("c/1/0", {"stream": "stderr", "text": "e\n"}, "scheduler-login") is True
     assert store.get_log("c/1/0", "stdout")["text"] == "a\nb\n" and store.get_log("c/1/0", "stderr")["text"] == "e\n"
+
+
+def test_late_older_run_start_does_not_erase_the_failure():
+    """Files are read one after the other: the child's crash can be ingested before the
+    wrapper's run.start, which is older. It must merge, not reopen."""
+    run = new_run("c/1/0")
+    apply(run, env("run.start", {"scheduler": {"name": "slurm"}, "host": "h", "start_ts": 10.0}, emitter="process-r0-h-2", pid=2))
+    apply(run, env("run.exception", {"type": "RuntimeError", "message": "boom", "fatal": True}, emitter="process-r0-h-2", pid=2, seq=1))
+    apply(run, env("run.end", {"status": "error", "exit_code": 1, "end_ts": 20.0, "duration_s": 10}, emitter="process-r0-h-2", pid=2, seq=2))
+    ch = apply(run, env("run.start", {"scheduler": {"name": "slurm"}, "host": "h", "start_ts": 9.0, "command": ["bash", "-lc", "x"]}, source="wrapper", emitter="wrapper-r0-h-1", pid=1))
+    assert ch == [] and run["phase"] == "ended" and run["status"] == "error"
+    assert run["exception"]["type"] == "RuntimeError" and run["command"] == "bash -lc x"
+    apply(run, env("run.end", {"status": "error", "exit_code": 1, "end_ts": 21.0}, source="wrapper", emitter="wrapper-r0-h-1", pid=1, seq=1))
+    assert run["exception"]["type"] == "RuntimeError" and run["exit_code"] == 1

@@ -117,9 +117,11 @@ def apply(run: Dict[str, Any], env: Dict[str, Any]) -> List[str]:
             if run["phase"] != "running":
                 changes.append("started")
             run["phase"] = "running"
-        elif not run.get("scheduler_terminal"):
+        elif not run.get("scheduler_terminal") and st > (run.get("end_ts") or 0):
             # a job runs several programs one after the other (``a && b``): the next one
-            # starts after the previous ``run.end``, the allocation is still alive
+            # starts after the previous ``run.end``, the allocation is still alive.
+            # (An older run.start that merely arrives late, e.g. the wrapper's file read
+            # after its child's, must not reopen anything nor erase the recorded failure.)
             run["phase"] = "running"
             run["status"] = None
             run["status_source"] = None
