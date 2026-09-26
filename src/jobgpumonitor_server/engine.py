@@ -53,7 +53,7 @@ class Engine:
                 light = dict(env, data={k: v for k, v in data.items() if k != "text"})
                 if not self.store.add_event(run_id, light):
                     continue
-                self.store.append_log(run_id, data)
+                self.store.append_log(run_id, data, env.get("emitter"))
             elif not self.store.add_event(run_id, env):
                 continue  # duplicate
             run = self._run(run_id)

@@ -410,3 +410,12 @@ def test_next_program_in_the_same_job_reopens_the_run():
     apply(run, sched("FAILED", terminal=True, exit_code=1))
     apply(run, env("run.start", {"scheduler": {"name": "slurm"}, "host": "h", "start_ts": 9.0}, emitter="process-r0-h-3", pid=3))
     assert run["phase"] == "ended" and run["status"] == "error"
+
+
+def test_log_stream_owned_by_first_emitter():
+    store = Store(":memory:")
+    assert store.append_log("c/1/0", {"stream": "stdout", "text": "a\n"}, "wrapper-r0-h-1") is True
+    assert store.append_log("c/1/0", {"stream": "stdout", "text": "A\n"}, "scheduler-login") is False
+    assert store.append_log("c/1/0", {"stream": "stdout", "text": "b\n"}, "wrapper-r0-h-1") is True
+    assert store.append_log("c/1/0", {"stream": "stderr", "text": "e\n"}, "scheduler-login") is True
+    assert store.get_log("c/1/0", "stdout")["text"] == "a\nb\n" and store.get_log("c/1/0", "stderr")["text"] == "e\n"

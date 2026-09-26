@@ -51,6 +51,9 @@ class Store:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.executescript(_SCHEMA)
+            cols = {r[1] for r in self._db.execute("PRAGMA table_info(logs)")}
+            if "emitter" not in cols:
+                self._db.execute("ALTER TABLE logs ADD COLUMN emitter TEXT")
 
     # ------------------------------------------------------------------ runs
 
@@ -136,11 +139,15 @@ class Store:
 
     # ------------------------------------------------------------------ logs (stdout/stderr chunks)
 
-    def append_log(self, run_id: str, data: Dict[str, Any]) -> None:
+    def append_log(self, run_id: str, data: Dict[str, Any], emitter: Optional[str] = None) -> bool:
+        """Append a chunk. A stream is owned by the first emitter that delivered it (the job's
+        wrapper and the login-node probe may both tail the same output): others are ignored."""
         stream = data.get("stream") or "stdout"
         text = data.get("text") or ""
         with self._lock:
-            row = self._db.execute("SELECT text, received FROM logs WHERE run_id=? AND stream=?", (run_id, stream)).fetchone()
+            row = self._db.execute("SELECT text, received, emitter FROM logs WHERE run_id=? AND stream=?", (run_id, stream)).fetchone()
+            if row and row["emitter"] and emitter and row["emitter"] != emitter:
+                return False
             cur = row["text"] if row else ""
             received = (row["received"] if row else 0) + len(text.encode("utf-8"))
             new = cur + text
@@ -148,12 +155,14 @@ class Store:
                 cut = new.find("\n", len(new) - LOG_KEEP_BYTES)
                 new = "[… début tronqué …]\n" + new[cut + 1 if cut >= 0 else len(new) - LOG_KEEP_BYTES:]
             self._db.execute(
-                "INSERT INTO logs(run_id,stream,path,text,size,received,truncated,eof,updated_ts) VALUES(?,?,?,?,?,?,?,?,?)"
+                "INSERT INTO logs(run_id,stream,path,text,size,received,truncated,eof,updated_ts,emitter) VALUES(?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(run_id,stream) DO UPDATE SET path=excluded.path, text=excluded.text, size=excluded.size,"
-                " received=excluded.received, truncated=excluded.truncated, eof=excluded.eof, updated_ts=excluded.updated_ts",
+                " received=excluded.received, truncated=excluded.truncated, eof=excluded.eof, updated_ts=excluded.updated_ts,"
+                " emitter=COALESCE(logs.emitter, excluded.emitter)",
                 (run_id, stream, data.get("path"), new, int(data.get("size") or 0), received,
-                 1 if data.get("truncated") else 0, 1 if data.get("eof") else 0, time.time()),
+                 1 if data.get("truncated") else 0, 1 if data.get("eof") else 0, time.time(), emitter),
             )
+            return True
 
     def get_log(self, run_id: str, stream: str, tail: Optional[int] = None) -> Optional[Dict[str, Any]]:
         with self._lock:

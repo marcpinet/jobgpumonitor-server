@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jobgpumonitor-server"
-version = "0.2.0"
+version = "0.3.0"
 description = "Consumer for jobgpumonitor events: run state, alert rules, notifications (ntfy, Telegram, webhook) and a small API."
 readme = "README.md"
 license = "MIT"
