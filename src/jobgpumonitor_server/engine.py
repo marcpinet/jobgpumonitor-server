@@ -47,7 +47,14 @@ class Engine:
         batch = self.ingestor.scan()
         changed: Dict[str, List[str]] = {}
         for run_id, env in batch:
-            if not self.store.add_event(run_id, env):
+            if env.get("type") == "log.chunk":
+                # the text goes to the logs table; the events table only keeps a light record
+                data = env.get("data") or {}
+                light = dict(env, data={k: v for k, v in data.items() if k != "text"})
+                if not self.store.add_event(run_id, light):
+                    continue
+                self.store.append_log(run_id, data)
+            elif not self.store.add_event(run_id, env):
                 continue  # duplicate
             run = self._run(run_id)
             changes = apply(run, env)
@@ -73,6 +80,7 @@ class Engine:
         if now - self._last_prune > 86400:
             self._last_prune = now
             self.store.prune_events(self.cfg.keep_events_days)
+            self.store.prune_logs(self.cfg.keep_events_days)
         return {"events": len(batch), "runs_changed": len(changed), "alerts": self.alerts_sent}
 
     def run_forever(self, stop=None) -> None:  # type: ignore[no-untyped-def]

@@ -6,6 +6,7 @@
     GET /runs/{run_id}/events?after=0&limit=1000&types=run.heartbeat,metric.log
     GET /runs/{run_id}/stream          server-sent events, new events as they are ingested
     GET /alerts?limit=100
+    GET /runs/{run_id}/logs[?stream=stdout&tail=200000]   live stdout/stderr rebuilt from log.chunk events
     POST /ingest                       JSON list of events (gzip ok), bearer = ingest_token
 """
 
@@ -124,6 +125,16 @@ def _build_app(store: Store, token: str = "", ingest_token: str = "", ingest_dir
     @app.get("/runs/{run_id:path}/events", dependencies=[Depends(auth)])
     def events(run_id: str, after: int = 0, limit: int = Query(1000, le=10000), types: Optional[str] = None) -> List[Dict[str, Any]]:
         return store.events(run_id, after_id=after, limit=limit, types=types.split(",") if types else None)
+
+    @app.get("/runs/{run_id:path}/logs", dependencies=[Depends(auth)])
+    def logs(run_id: str, stream: Optional[str] = None, tail: int = Query(200_000, le=4_000_000)) -> Any:
+        """Without ``stream``: the streams available. With it: the (tail of the) reconstructed file."""
+        if not stream:
+            return store.log_streams(run_id)
+        doc = store.get_log(run_id, stream, tail=tail)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="no such log")
+        return doc
 
     @app.get("/runs/{run_id:path}/stream", dependencies=[Depends(auth)])
     async def stream(run_id: str, after: int = 0) -> Any:

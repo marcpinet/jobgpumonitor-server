@@ -361,3 +361,36 @@ def test_ingest_endpoint_writes_files_engine_reads_them(tmp_path):
     # no ingest token configured -> 503, never silently open
     closed = TestClient(create_app(store, token="read", ingest_dir=str(base)))
     assert closed.post("/ingest", json=[ev1], headers={"Authorization": "Bearer write"}).status_code == 503
+
+
+def test_log_chunks_rebuild_files_and_are_served(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from jobgpumonitor_server.api import create_app
+
+    base = tmp_path / "ev"
+    cfg = Config(dirs=[str(base)], db=":memory:")
+    eng = Engine(cfg, notifiers=[])
+    def chunk(seq, stream, off, text, **kw):
+        data = {"stream": stream, "path": f"/x/j.{stream[3:]}", "offset": off, "text": text, "size": off + len(text), "truncated": False, "eof": False, **kw}
+        return env("log.chunk", data, run_id="c/9/0", source="scheduler", emitter="scheduler-l", pid=3, seq=seq)
+
+    write_events(base, "c/9/0", "scheduler-l.jsonl", [chunk(0, "stdout", 0, "epoch 1\n"), chunk(1, "stderr", 0, "warn\n"), chunk(2, "stdout", 8, "epoch 2\n", eof=True)])
+    eng.cycle()
+    assert eng.store.get_log("c/9/0", "stdout")["text"] == "epoch 1\nepoch 2\n"
+    assert eng.store.get_log("c/9/0", "stdout")["eof"] is True and eng.store.get_log("c/9/0", "stderr")["text"] == "warn\n"
+    assert eng.store.get_run("c/9/0")["logs"]["stdout"]["path"] == "/x/j.out"
+    # the events table keeps the record without the text
+    evs = eng.store.events("c/9/0", types=["log.chunk"])
+    assert len(evs) == 3 and "text" not in evs[0]["data"]
+    # re-ingesting the same file (offsets reset) does not duplicate
+    eng.ingestor.store.set_offset(str(base / "runs" / "c" / "9" / "0" / "scheduler-l.jsonl"), 0, None, 0)
+    eng.cycle()
+    assert eng.store.get_log("c/9/0", "stdout")["text"] == "epoch 1\nepoch 2\n"
+    client = TestClient(create_app(eng.store, token="t"))
+    h = {"Authorization": "Bearer t"}
+    assert [s["stream"] for s in client.get("/runs/c/9/0/logs", headers=h).json()] == ["stdout", "stderr"]
+    r = client.get("/runs/c/9/0/logs?stream=stdout&tail=8", headers=h).json()
+    assert r["text"] == "epoch 2\n" and r["head_cut"] is True
+    assert client.get("/runs/c/9/0/logs?stream=nope", headers=h).status_code == 404

@@ -48,7 +48,7 @@ def new_run(run_id: str) -> Dict[str, Any]:
         "progress": [], "metrics": {}, "eta_vs_deadline_s": None,
         "gpu_util_last": None, "gpu_idle_since": None, "mem_pct_last": None, "mem_limit": None, "max_rss": None,
         "exception": None, "warnings": 0, "last_logs": [], "last_signal": None, "stderr_tail": None,
-        "summary": None, "emitters": [], "ranks": None, "notified_status": None,
+        "summary": None, "emitters": [], "ranks": None, "notified_status": None, "logs": {},
         "events": 0, "updated_ts": None,
     }
 
@@ -160,6 +160,10 @@ def apply(run: Dict[str, Any], env: Dict[str, Any]) -> List[str]:
         if data.get("levelno", 30) >= 30:
             run["warnings"] = run.get("warnings", 0) + 1
         run["last_logs"] = (run.get("last_logs") or [])[-4:] + [f"{data.get('level')}: {data.get('message', '')[:300]}"]
+
+    elif etype == "log.chunk":
+        logs = run.setdefault("logs", {})
+        logs[data.get("stream") or "stdout"] = {"path": data.get("path"), "size": data.get("size"), "eof": bool(data.get("eof"))}
 
     elif etype == "run.exception":
         if data.get("fatal", True):

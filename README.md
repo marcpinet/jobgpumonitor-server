@@ -48,6 +48,7 @@ GET /runs?phase=running
 GET /runs/<cluster>/<job>/<restart>
 GET /runs/<cluster>/<job>/<restart>/events?after=0&types=metric.log,progress.update
 GET /runs/<cluster>/<job>/<restart>/stream          # server-sent events
+GET /runs/<cluster>/<job>/<restart>/logs?stream=stdout   # the job's .out/.err, live
 GET /alerts
 ```
 

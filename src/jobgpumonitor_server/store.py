@@ -28,7 +28,15 @@ CREATE TABLE IF NOT EXISTS alerts (
   ts REAL NOT NULL, delivered TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_unique ON alerts(run_id, key);
+CREATE TABLE IF NOT EXISTS logs (
+  run_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT, text TEXT NOT NULL DEFAULT '',
+  size INTEGER NOT NULL DEFAULT 0, received INTEGER NOT NULL DEFAULT 0, truncated INTEGER NOT NULL DEFAULT 0,
+  eof INTEGER NOT NULL DEFAULT 0, updated_ts REAL NOT NULL, PRIMARY KEY (run_id, stream)
+);
 """
+
+#: Per stream, keep at most this much text (the head is dropped, a marker is kept).
+LOG_KEEP_BYTES = 4 * 1024 * 1024
 
 
 class Store:
@@ -124,6 +132,53 @@ class Store:
         cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - older_than_days * 86400))
         with self._lock:
             cur = self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+            return cur.rowcount
+
+    # ------------------------------------------------------------------ logs (stdout/stderr chunks)
+
+    def append_log(self, run_id: str, data: Dict[str, Any]) -> None:
+        stream = data.get("stream") or "stdout"
+        text = data.get("text") or ""
+        with self._lock:
+            row = self._db.execute("SELECT text, received FROM logs WHERE run_id=? AND stream=?", (run_id, stream)).fetchone()
+            cur = row["text"] if row else ""
+            received = (row["received"] if row else 0) + len(text.encode("utf-8"))
+            new = cur + text
+            if len(new) > LOG_KEEP_BYTES:
+                cut = new.find("\n", len(new) - LOG_KEEP_BYTES)
+                new = "[… début tronqué …]\n" + new[cut + 1 if cut >= 0 else len(new) - LOG_KEEP_BYTES:]
+            self._db.execute(
+                "INSERT INTO logs(run_id,stream,path,text,size,received,truncated,eof,updated_ts) VALUES(?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(run_id,stream) DO UPDATE SET path=excluded.path, text=excluded.text, size=excluded.size,"
+                " received=excluded.received, truncated=excluded.truncated, eof=excluded.eof, updated_ts=excluded.updated_ts",
+                (run_id, stream, data.get("path"), new, int(data.get("size") or 0), received,
+                 1 if data.get("truncated") else 0, 1 if data.get("eof") else 0, time.time()),
+            )
+
+    def get_log(self, run_id: str, stream: str, tail: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM logs WHERE run_id=? AND stream=?", (run_id, stream)).fetchone()
+        if not row:
+            return None
+        text = row["text"]
+        cut_head = False
+        if tail and len(text) > tail:
+            text = text[-tail:]
+            cut_head = True
+        return {"run_id": run_id, "stream": stream, "path": row["path"], "text": text, "size": row["size"],
+                "received": row["received"], "truncated": bool(row["truncated"]), "eof": bool(row["eof"]),
+                "updated_ts": row["updated_ts"], "head_cut": cut_head}
+
+    def log_streams(self, run_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute("SELECT stream, path, size, received, truncated, eof, updated_ts FROM logs WHERE run_id=? ORDER BY stream DESC", (run_id,)).fetchall()
+        return [dict(r) for r in rows]  # stdout first
+
+    def prune_logs(self, older_than_days: int) -> int:
+        if older_than_days <= 0:
+            return 0
+        with self._lock:
+            cur = self._db.execute("DELETE FROM logs WHERE updated_ts < ?", (time.time() - older_than_days * 86400,))
             return cur.rowcount
 
     # ------------------------------------------------------------------ offsets
