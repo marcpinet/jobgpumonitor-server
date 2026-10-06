@@ -119,12 +119,24 @@ def evaluate(run: Dict[str, Any], changes: List[str], cfg: AlertsConfig, sent: O
         if "finished" not in sent and not waiting_for_scheduler:
             out.append(_finished_alert(run, name, status))
             run["notified_status"] = status
-        elif "scheduler_ended" in changes and run.get("notified_status") not in (None, status) and status in BAD_STATUSES:
+        elif ("scheduler_ended" in changes and run.get("notified_status") not in (None, status)
+              and (status in BAD_STATUSES or run.get("notified_status") == "unknown")):
+            # e.g. UNKNOWN_ENDED while accounting was down, then the real verdict
             a = _finished_alert(run, name, status)
             a.key = "finished_correction"
             a.title = "⚠️ correction: " + a.title
             out.append(a)
             run["notified_status"] = status
+
+    hb = run.get("last_heartbeat_ts")
+    if run.get("stalled_alerted") and hb and hb > (run.get("stalled_hb_ts") or 0):
+        # heartbeats are back: say so, and re-arm the stalled alert for a later silence
+        run["stalled_alerted"] = False
+        n = int(run.get("stall_count") or 1)
+        key = "resumed" if n == 1 else f"resumed:{n}"
+        if run.get("phase") == "running" and key not in sent:
+            body = f"heartbeats are back after {fmt_duration(hb - (run.get('stalled_hb_ts') or hb))} of silence"
+            out.append(Alert(key, "info", f"🔄 {name} reporting again", body, rid))
 
     if cfg.will_timeout and "will_timeout" not in sent and run.get("phase") == "running":
         eta = run.get("eta_vs_deadline_s")
@@ -176,8 +188,10 @@ def _finished_alert(run: Dict[str, Any], name: str, status: str) -> Alert:
     return Alert("finished", level, f"❌ {name} {label}", body, rid)
 
 
-def evaluate_periodic(run: Dict[str, Any], cfg: AlertsConfig, sent: Optional[set] = None, now: Optional[float] = None) -> List[Alert]:
-    """Time-based alerts for active runs (call every poll)."""
+def evaluate_periodic(run: Dict[str, Any], cfg: AlertsConfig, sent: Optional[set] = None, now: Optional[float] = None,
+                      cluster_fresh_ts: Optional[float] = None) -> List[Alert]:
+    """Time-based alerts for active runs (call every poll). ``cluster_fresh_ts``: when an event
+    of any run of this run's cluster was last ingested (``None``: unknown)."""
     sent = sent or set()
     now = now or time.time()
     out: List[Alert] = []
@@ -194,15 +208,24 @@ def evaluate_periodic(run: Dict[str, Any], cfg: AlertsConfig, sent: Optional[set
         return out
 
     hb = run.get("last_heartbeat_ts")
-    if hb and "stalled" not in sent and not run.get("scheduler_terminal"):
+    if hb and not run.get("stalled_alerted") and not run.get("scheduler_terminal"):
         limit = cfg.stalled_after_s or max(60.0, 3.0 * float(run.get("heartbeat_s") or 15))
         silent = now - hb
-        if silent > limit:
-            body = f"no heartbeat for {fmt_duration(silent)}"
-            if run.get("scheduler_state"):
-                body += f", scheduler says {run['scheduler_state']}"
-            body += "\nthe process is dead or frozen; if the scheduler still says RUNNING the allocation is being wasted"
-            out.append(Alert("stalled", "error", f"💀 {name} stopped reporting", body, rid))
+        # When nothing at all arrives from the cluster, the pipe (agent, forwarder, proxy) is
+        # more likely down than every job at once: wait longer before blaming the job.
+        cluster_silent = cluster_fresh_ts is not None and now - cluster_fresh_ts > limit
+        if silent > (max(limit, cfg.stalled_cluster_silent_s) if cluster_silent else limit):
+            n = int(run.get("stall_count") or 0) + 1
+            key = "stalled" if n == 1 else f"stalled:{n}"
+            if key not in sent:
+                body = f"no heartbeat for {fmt_duration(silent)}"
+                if run.get("scheduler_state"):
+                    body += f", scheduler says {run['scheduler_state']}"
+                body += "\nthe process is dead or frozen; if the scheduler still says RUNNING the allocation is being wasted"
+                if cluster_silent:
+                    body += "\nnothing else arrives from this cluster either: the agent or the forwarder may be down too"
+                out.append(Alert(key, "error", f"💀 {name} stopped reporting", body, rid))
+            run.update(stalled_alerted=True, stall_count=n, stalled_hb_ts=hb)
 
     if cfg.gpu_idle_min and "gpu_idle" not in sent and run.get("gpus"):
         since = run.get("gpu_idle_since")

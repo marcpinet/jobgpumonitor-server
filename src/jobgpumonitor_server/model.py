@@ -49,6 +49,7 @@ def new_run(run_id: str) -> Dict[str, Any]:
         "gpu_util_last": None, "gpu_idle_since": None, "mem_pct_last": None, "mem_limit": None, "max_rss": None,
         "exception": None, "warnings": 0, "last_logs": [], "last_signal": None, "stderr_tail": None,
         "summary": None, "emitters": [], "ranks": None, "notified_status": None, "logs": {},
+        "stalled_alerted": False, "stall_count": 0, "stalled_hb_ts": None,
         "events": 0, "updated_ts": None,
     }
 
@@ -231,9 +232,18 @@ def apply(run: Dict[str, Any], env: Dict[str, Any]) -> List[str]:
         state = data.get("state") or ""
         if data.get("terminal"):
             st = _SCHED_STATUS.get(state, "unknown")
+            prev = run.get("status")
             # the scheduler is authoritative for how the allocation ended, except that a clean
-            # COMPLETED must not hide an error the process itself reported
-            if not (st == "ok" and run.get("status") in BAD_STATUSES):
+            # COMPLETED must not hide an error the process itself reported, and that "ended,
+            # accounting unavailable" (UNKNOWN_ENDED) tells less than what we already know;
+            # a later real verdict replaces it
+            if st == "unknown":
+                keep = prev is not None
+            elif st == "ok":
+                keep = prev in BAD_STATUSES and prev != "unknown"
+            else:
+                keep = False
+            if not keep:
                 run["status"] = st
                 run["status_source"] = "scheduler"
             if data.get("exit_code") is not None and run.get("exit_code") is None:

@@ -44,13 +44,12 @@ class NtfyNotifier(Notifier):
 
     def send(self, alert: Alert, run: Dict[str, Any]) -> None:
         headers = {
-            "Title": alert.title.encode("utf-8").decode("latin-1", "replace") if not alert.title.isascii() else alert.title,
+            # ntfy header values must be latin-1; emoji in the title go through the tags instead
+            "Title": "".join(ch for ch in alert.title if ord(ch) < 256).strip() or "jobgpumonitor",
             "Priority": self.priority.get(alert.level, "3"),
             "Tags": _NTFY_TAGS.get(alert.level, ""),
             "Content-Type": "text/plain; charset=utf-8",
         }
-        # ntfy header values must be latin-1; emoji in the title go through the tags instead
-        headers["Title"] = "".join(ch for ch in alert.title if ord(ch) < 256).strip() or "jobgpumonitor"
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
         _post(self.url, alert.body.encode("utf-8"), headers)

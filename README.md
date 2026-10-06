@@ -34,9 +34,14 @@ time-outs, preemptions and the queue are reported too.
 | ⏱ will not finish in time | tqdm ETA overshoots the job deadline by more than 2 minutes |
 | 🧠 memory | above 90 % of the cgroup / requested memory |
 | 🥱 GPU idle | every visible GPU under 5 % for 15 minutes |
-| 💀 stopped reporting | no heartbeat for 3 intervals while the scheduler still says RUNNING |
+| 💀 stopped reporting | no heartbeat for 3 intervals while the scheduler still says RUNNING (15 min when nothing at all arrives from the cluster: the agent or the proxy is then the likelier culprit) |
+| 🔄 reporting again | heartbeats are back after a 💀; the next silence is reported again |
+| ⚠️ correction | the scheduler's real verdict arrives after an `UNKNOWN_ENDED` (accounting was down) |
 
 Every alert fires once per run and is recorded, so restarting the server never re-sends.
+A channel that fails (ntfy down, no network) gets the alert again later, with backoff, for
+up to 6 hours; the other channels are not sent it twice. Raw events are kept
+`keep_events_days` after they are received (not after they were emitted).
 
 ## API
 

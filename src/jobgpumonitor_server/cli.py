@@ -133,7 +133,8 @@ def cmd_alerts(args: argparse.Namespace) -> int:
     store = Store(cfg.db)
     for a in store.list_alerts(limit=args.limit):
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(a["ts"]))
-        print(f"{ts}  {a['level']:<8} {a['run_id']:<34} {a['title']}   [{a['delivered'] or 'not delivered'}]")
+        retry = f", retrying {a['pending']}" if a.get("pending") else ""
+        print(f"{ts}  {a['level']:<8} {a['run_id']:<34} {a['title']}   [{a['delivered'] or 'not delivered'}{retry}]")
     return 0
 
 

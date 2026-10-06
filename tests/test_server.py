@@ -433,3 +433,135 @@ def test_late_older_run_start_does_not_erase_the_failure():
     assert run["exception"]["type"] == "RuntimeError" and run["command"] == "bash -lc x"
     apply(run, env("run.end", {"status": "error", "exit_code": 1, "end_ts": 21.0}, source="wrapper", emitter="wrapper-r0-h-1", pid=1, seq=1))
     assert run["exception"]["type"] == "RuntimeError" and run["exit_code"] == 1
+
+
+# --------------------------------------------------------------------------- retention, retries, stalls
+
+
+def test_retention_counts_from_ingestion_not_emission(tmp_path):
+    """A backlog older than keep_events_days lands intact; only events received long ago are pruned."""
+    base = tmp_path / "ev"
+    cfg = Config(dirs=[str(base)], db=":memory:", keep_events_days=30)
+    eng = Engine(cfg, notifiers=[])
+    old = "2020-01-01T00:00:00.000Z"
+    write_events(base, "c/1/0", "process-r0-h-1.jsonl", [env("run.start", {"host": "h", "start_ts": 1.0}, ts=old),
+                                                         env("metric.log", {"metrics": {"a": 1}}, seq=1, ts=old)])
+    eng.cycle()  # first cycle also prunes
+    assert len(eng.store.events("c/1/0")) == 2
+    eng.store._db.execute("UPDATE events SET ingested_ts=? WHERE seq=0", (time.time() - 31 * 86400,))
+    eng.store._db.execute("UPDATE events SET ingested_ts=NULL WHERE seq=1")  # row from before the column: ts decides
+    assert eng.store.prune_events(30) == 2 and eng.store.events("c/1/0") == []
+
+
+class FlakyNotifier(Notifier):
+    name = "flaky"
+
+    def __init__(self, fail: int):
+        self.fail = fail
+        self.sent = []
+
+    def send(self, alert, run):
+        if self.fail > 0:
+            self.fail -= 1
+            raise OSError("network down")
+        self.sent.append(alert)
+
+
+def test_undelivered_alert_is_retried_on_the_channels_that_missed_it(tmp_path):
+    base = tmp_path / "ev"
+    flaky, ok = FlakyNotifier(fail=2), ListNotifier()
+    eng = Engine(Config(dirs=[str(base)], db=":memory:"), notifiers=[flaky, ok])
+    write_events(base, "c/1/0", "process-r0-h-1.jsonl", [env("run.start", {"host": "h", "start_ts": 1.0})])
+    eng.cycle(now=1000.0)
+    assert [a.key for a in ok.sent] == ["started"] and flaky.sent == []
+    row = eng.store.list_alerts()[0]
+    assert row["delivered"] == "list" and row["pending"] == "flaky"
+    eng.cycle(now=1030.0)  # not due yet (1 min backoff)
+    assert flaky.fail == 1
+    eng.cycle(now=1061.0)  # due, fails again -> 2 min backoff
+    assert flaky.sent == [] and flaky.fail == 0
+    eng.cycle(now=1200.0)
+    assert [a.key for a in flaky.sent] == ["started"] and [a.key for a in ok.sent] == ["started"]  # the other channel is not spammed
+    row = eng.store.list_alerts()[0]
+    assert set(row["delivered"].split(",")) == {"list", "flaky"} and not row["pending"]
+
+
+def test_stall_waits_when_the_whole_cluster_is_silent_then_resumes_and_rearms():
+    cfg = AlertsConfig(gpu_idle_min=0, stalled_cluster_silent_s=900)
+    now = 100_000.0
+    run = new_run("c/1/0")
+    run.update(phase="running", heartbeat_s=15, last_heartbeat_ts=now - 120)
+    # every run of the cluster went quiet at the same time: the pipe is suspect, hold the alert
+    assert evaluate_periodic(run, cfg, now=now, cluster_fresh_ts=now - 120) == []
+    # other jobs of the cluster still report: this one is stuck
+    a = evaluate_periodic(run, cfg, now=now, cluster_fresh_ts=now - 5)
+    assert [x.key for x in a] == ["stalled"] and run["stalled_alerted"] is True
+    assert evaluate_periodic(run, cfg, sent={"stalled"}, now=now + 60, cluster_fresh_ts=now) == []  # once per silence
+    # heartbeats come back: "reporting again", and the alert is re-armed
+    run["last_heartbeat_ts"] = now + 100
+    a = evaluate(run, ["heartbeat"], cfg, sent={"stalled"})
+    assert [x.key for x in a] == ["resumed"] and run["stalled_alerted"] is False
+    a = evaluate_periodic(run, cfg, sent={"stalled", "resumed"}, now=now + 400, cluster_fresh_ts=now + 399)
+    assert [x.key for x in a] == ["stalled:2"]
+    # a long silence of the whole cluster still ends up reported (a single job, no probe)
+    run2 = new_run("c/2/0")
+    run2.update(phase="running", heartbeat_s=15, last_heartbeat_ts=now - 1000)
+    a = evaluate_periodic(run2, cfg, now=now, cluster_fresh_ts=now - 1000)
+    assert [x.key for x in a] == ["stalled"] and "agent or the forwarder" in a[0].body
+
+
+def test_unknown_end_is_corrected_by_a_late_verdict():
+    run = new_run("c/1/0")
+    apply(run, sched("RUNNING", active=True, start_ts=10.0))
+    ch = apply(run, dict(sched("UNKNOWN_ENDED", terminal=True), seq=1))
+    assert run["status"] == "unknown"
+    a = evaluate(run, ch, AlertsConfig())
+    assert [x.key for x in a] == ["finished"] and run["notified_status"] == "unknown"
+    ch = apply(run, dict(sched("OUT_OF_MEMORY", terminal=True, change="verdict"), seq=2))
+    assert run["status"] == "oom"
+    a = evaluate(run, ch, AlertsConfig(), sent={"started", "finished"})
+    assert [x.key for x in a] == ["finished_correction"] and "OOM" in a[0].title
+    # COMPLETED also replaces a provisional unknown
+    run2 = new_run("c/2/0")
+    apply(run2, sched("UNKNOWN_ENDED", terminal=True))
+    apply(run2, dict(sched("COMPLETED", terminal=True), seq=1))
+    assert run2["status"] == "ok"
+    # but "accounting unavailable" never hides what the process itself reported
+    run3 = new_run("c/3/0")
+    apply(run3, env("run.start", {"host": "h", "start_ts": 1.0}))
+    apply(run3, env("run.end", {"status": "ok", "exit_code": 0}, seq=1))
+    apply(run3, sched("UNKNOWN_ENDED", terminal=True))
+    assert run3["status"] == "ok"
+
+
+def test_ingest_rejects_dot_dot_and_gzip_bombs(tmp_path):
+    pytest.importorskip("fastapi")
+    import gzip
+
+    from fastapi.testclient import TestClient
+
+    from jobgpumonitor_server import api
+    from jobgpumonitor_server.api import create_app
+
+    base = tmp_path / "srv" / "ev"
+    client = TestClient(create_app(Store(":memory:"), ingest_token="w", ingest_dir=str(base)))
+    h = {"Authorization": "Bearer w"}
+    sneaky = [env("run.start", {}, run_id="../../0", emitter="x"), env("run.start", {}, run_id="c/../0", emitter="x"),
+              env("run.start", {}, run_id="c/1/0", emitter="..")]
+    assert client.post("/ingest", json=sneaky, headers=h).json() == {"accepted": 0, "rejected": 3}
+    assert not (tmp_path / "srv" / "0").exists()
+    bomb = gzip.compress(b"[" + b" " * (api._MAX_INFLATED + 10) + b"]")
+    assert len(bomb) < 1024 * 1024
+    r = client.post("/ingest", content=bomb, headers={**h, "Content-Encoding": "gzip", "Content-Type": "application/json"})
+    assert r.status_code == 413
+    assert client.post("/ingest", content=b"not gzip", headers={**h, "Content-Encoding": "gzip"}).status_code == 400
+
+
+def test_log_chunks_fold_redraws_and_mark_skipped_bytes():
+    store = Store(":memory:")
+    store.append_log("c/1/0", {"stream": "stderr", "text": "start\nepoch 1:  10%\r"})
+    store.append_log("c/1/0", {"stream": "stderr", "text": "epoch 1:  50%\repoch 1: 100%\nnext\n"})
+    assert store.get_log("c/1/0", "stderr")["text"] == "start\nepoch 1: 100%\nnext\n"
+    store.append_log("c/1/0", {"stream": "stderr", "text": "Traceback ...\n", "skipped": 3 * 1024 * 1024, "truncated": True})
+    text = store.get_log("c/1/0", "stderr")["text"]
+    assert text.endswith("next\n[… 3.0 Mo sautés …]\nTraceback ...\n")

@@ -13,6 +13,14 @@ from .notify import Notifier, build_notifiers, dispatch
 from .rules import Alert, evaluate, evaluate_periodic
 from .store import Store
 
+#: How long a channel that missed an alert keeps being retried (with backoff).
+ALERT_RETRY_FOR_S = 6 * 3600.0
+
+
+def _retry_delay(attempts: int) -> float:
+    """1 min after the first failure, then doubling, at most 30 min."""
+    return min(60.0 * 2 ** max(0, attempts - 1), 1800.0)
+
 
 class Engine:
     def __init__(self, cfg: Config, store: Optional[Store] = None, notifiers: Optional[List[Notifier]] = None, quiet: bool = False) -> None:
@@ -34,11 +42,31 @@ class Engine:
             self._cache[run_id] = run
         return run
 
-    def _notify(self, run: Dict[str, Any], alerts: List[Alert]) -> None:
+    def _notify(self, run: Dict[str, Any], alerts: List[Alert], now: Optional[float] = None) -> None:
+        now = now or time.time()
         for a in alerts:
             delivered = dispatch(self.notifiers, a, run)
-            self.store.record_alert(run["run_id"], a.key, a.level, a.title, a.body, delivered)
+            failed = [n.name for n in self.notifiers if n.name not in delivered]
+            self.store.record_alert(run["run_id"], a.key, a.level, a.title, a.body, delivered,
+                                    pending=failed, next_try_ts=now + _retry_delay(1))
             self.alerts_sent += 1
+
+    def _retry_alerts(self, now: float) -> None:
+        """Send again, to the channels that missed them, the alerts a failure kept from going out."""
+        for row in self.store.pending_alerts(now):
+            names = [n for n in (row["pending"] or "").split(",") if n]
+            targets = [n for n in self.notifiers if n.name in names]
+            delivered = [n for n in (row["delivered"] or "").split(",") if n]
+            if not targets or now - row["ts"] > ALERT_RETRY_FOR_S:
+                print(f"[jgmd] giving up on alert {row['key']!r} of {row['run_id']} for {', '.join(names)}", file=sys.stderr)
+                self.store.update_alert_delivery(row["id"], delivered, [], row["attempts"], None)
+                continue
+            alert = Alert(row["key"], row["level"], row["title"], row["body"], row["run_id"])
+            run = self.store.get_run(row["run_id"]) or {"run_id": row["run_id"]}
+            ok = dispatch(targets, alert, run)
+            attempts = int(row["attempts"] or 0) + 1
+            left = [n for n in names if n not in ok]
+            self.store.update_alert_delivery(row["id"], delivered + ok, left, attempts, now + _retry_delay(attempts))
 
     def cycle(self, now: Optional[float] = None) -> Dict[str, int]:
         """One pass. Returns counters (for ``--once`` and tests)."""
@@ -65,15 +93,17 @@ class Engine:
             sent = self.store.alert_keys(run_id)
             alerts = evaluate(run, changes, self.cfg.alerts, sent)
             self.store.upsert_run(run)
-            self._notify(run, alerts)
+            self._notify(run, alerts, now)
         # time-based rules on active runs, plus recently ended ones still waiting for the scheduler
+        fresh = self.store.cluster_freshness()
         for run in self.store.active_runs() + self.store.list_runs(phase="ended", limit=50):
             run = self._run(run["run_id"])
             sent = self.store.alert_keys(run["run_id"])
-            alerts = evaluate_periodic(run, self.cfg.alerts, sent, now)
+            alerts = evaluate_periodic(run, self.cfg.alerts, sent, now, cluster_fresh_ts=fresh.get(run.get("cluster")))
             if alerts:
-                self._notify(run, alerts)
+                self._notify(run, alerts, now)
                 self.store.upsert_run(run)
+        self._retry_alerts(now)
         # forget ended runs from the cache, prune old events daily
         for rid in [r for r, doc in self._cache.items() if doc.get("phase") == "ended" and now - (doc.get("updated_ts") or now) > 600]:
             del self._cache[rid]

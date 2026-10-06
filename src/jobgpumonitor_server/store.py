@@ -51,9 +51,18 @@ class Store:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.executescript(_SCHEMA)
-            cols = {r[1] for r in self._db.execute("PRAGMA table_info(logs)")}
-            if "emitter" not in cols:
-                self._db.execute("ALTER TABLE logs ADD COLUMN emitter TEXT")
+            self._add_columns("logs", {"emitter": "TEXT"})
+            # ingestion time: retention counts from when we received an event, not from when
+            # it was emitted (a backlog shipped late must not be dropped as soon as it lands)
+            self._add_columns("events", {"ingested_ts": "REAL"})
+            # channels an alert still has to reach, retried with backoff
+            self._add_columns("alerts", {"pending": "TEXT", "attempts": "INTEGER NOT NULL DEFAULT 0", "next_try_ts": "REAL"})
+
+    def _add_columns(self, table: str, cols: Dict[str, str]) -> None:
+        have = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols.items():
+            if name not in have:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     # ------------------------------------------------------------------ runs
 
@@ -92,6 +101,12 @@ class Store:
             rows = self._db.execute(q, args).fetchall()
         return [json.loads(r["doc"]) for r in rows]
 
+    def cluster_freshness(self) -> Dict[str, float]:
+        """Per cluster, when an event of any of its runs was last ingested."""
+        with self._lock:
+            rows = self._db.execute("SELECT cluster, MAX(updated_ts) AS t FROM runs GROUP BY cluster").fetchall()
+        return {r["cluster"]: r["t"] for r in rows if r["t"] is not None}
+
     def active_runs(self) -> List[Dict[str, Any]]:
         with self._lock:
             rows = self._db.execute("SELECT doc FROM runs WHERE phase IN ('queued','running')").fetchall()
@@ -103,9 +118,9 @@ class Store:
         with self._lock:
             try:
                 self._db.execute(
-                    "INSERT INTO events(run_id,ts,type,emitter,pid,seq,doc) VALUES(?,?,?,?,?,?,?)",
+                    "INSERT INTO events(run_id,ts,type,emitter,pid,seq,doc,ingested_ts) VALUES(?,?,?,?,?,?,?,?)",
                     (run_id, env.get("ts"), env.get("type"), env.get("emitter"), env.get("pid"), env.get("seq"),
-                     json.dumps(env, separators=(",", ":"))),
+                     json.dumps(env, separators=(",", ":")), time.time()),
                 )
                 return True
             except sqlite3.IntegrityError:
@@ -130,11 +145,15 @@ class Store:
         return out
 
     def prune_events(self, older_than_days: int) -> int:
+        """Drop events ingested more than ``older_than_days`` ago (rows from before the
+        ``ingested_ts`` column fall back to their emission time)."""
         if older_than_days <= 0:
             return 0
-        cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - older_than_days * 86400))
+        cutoff = time.time() - older_than_days * 86400
+        cutoff_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(cutoff))
         with self._lock:
-            cur = self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+            cur = self._db.execute(
+                "DELETE FROM events WHERE ingested_ts < ? OR (ingested_ts IS NULL AND ts < ?)", (cutoff, cutoff_iso))
             return cur.rowcount
 
     # ------------------------------------------------------------------ logs (stdout/stderr chunks)
@@ -144,13 +163,15 @@ class Store:
         wrapper and the login-node probe may both tail the same output): others are ignored."""
         stream = data.get("stream") or "stdout"
         text = data.get("text") or ""
+        if data.get("skipped"):
+            text = f"[… {_human_bytes(data['skipped'])} sautés …]\n" + text
         with self._lock:
             row = self._db.execute("SELECT text, received, emitter FROM logs WHERE run_id=? AND stream=?", (run_id, stream)).fetchone()
             if row and row["emitter"] and emitter and row["emitter"] != emitter:
                 return False
             cur = row["text"] if row else ""
             received = (row["received"] if row else 0) + len(text.encode("utf-8"))
-            new = cur + text
+            new = _append_folded(cur, text)
             if len(new) > LOG_KEEP_BYTES:
                 cut = new.find("\n", len(new) - LOG_KEEP_BYTES)
                 new = "[… début tronqué …]\n" + new[cut + 1 if cut >= 0 else len(new) - LOG_KEEP_BYTES:]
@@ -217,19 +238,36 @@ class Store:
             rows = self._db.execute("SELECT key FROM alerts WHERE run_id=?", (run_id,)).fetchall()
         return {r["key"] for r in rows}
 
-    def record_alert(self, run_id: str, key: str, level: str, title: str, body: str, delivered: List[str]) -> bool:
+    def record_alert(self, run_id: str, key: str, level: str, title: str, body: str, delivered: List[str],
+                     pending: Optional[List[str]] = None, next_try_ts: Optional[float] = None) -> bool:
         with self._lock:
             try:
                 self._db.execute(
-                    "INSERT INTO alerts(run_id,key,level,title,body,ts,delivered) VALUES(?,?,?,?,?,?,?)",
-                    (run_id, key, level, title, body, time.time(), ",".join(delivered)),
+                    "INSERT INTO alerts(run_id,key,level,title,body,ts,delivered,pending,attempts,next_try_ts)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (run_id, key, level, title, body, time.time(), ",".join(delivered), ",".join(pending or []), 1,
+                     next_try_ts if pending else None),
                 )
                 return True
             except sqlite3.IntegrityError:
                 return False
 
+    def pending_alerts(self, now: float) -> List[Dict[str, Any]]:
+        """Alerts that some channel has not received yet and that are due for another try."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id,run_id,key,level,title,body,ts,delivered,pending,attempts FROM alerts"
+                " WHERE pending IS NOT NULL AND pending != '' AND next_try_ts <= ? ORDER BY id", (now,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_alert_delivery(self, alert_id: int, delivered: List[str], pending: List[str], attempts: int,
+                              next_try_ts: Optional[float]) -> None:
+        with self._lock:
+            self._db.execute("UPDATE alerts SET delivered=?, pending=?, attempts=?, next_try_ts=? WHERE id=?",
+                             (",".join(delivered), ",".join(pending), attempts, next_try_ts if pending else None, alert_id))
+
     def list_alerts(self, limit: int = 100, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        q = "SELECT run_id,key,level,title,body,ts,delivered FROM alerts"
+        q = "SELECT run_id,key,level,title,body,ts,delivered,pending,attempts FROM alerts"
         args: List[Any] = []
         if run_id:
             q += " WHERE run_id=?"
@@ -243,3 +281,40 @@ class Store:
     def close(self) -> None:
         with self._lock:
             self._db.close()
+
+
+def _fold_redraws(text: str) -> str:
+    """What a terminal shows once carriage returns redrew a line (tqdm): the last state of
+    each line. A last line still being drawn keeps its trailing ``\\r`` so that what comes
+    next overwrites it."""
+    lines = text.split("\n")
+    last = len(lines) - 1
+    for i, line in enumerate(lines):
+        if "\r" in line:
+            parts = [p for p in line.split("\r") if p]
+            folded = parts[-1] if parts else ""
+            if i == last and line.endswith("\r"):
+                folded += "\r"
+            lines[i] = folded
+    return "\n".join(lines)
+
+
+def _append_folded(cur: str, text: str) -> str:
+    """``cur + text``, with redraws folded across the junction (emitters fold within a
+    chunk; a line redrawn over two chunks is folded here)."""
+    j = cur.rfind("\n") + 1
+    if "\r" not in text and "\r" not in cur[j:]:
+        return cur + text
+    return cur[:j] + _fold_redraws(cur[j:] + text)
+
+
+def _human_bytes(n: Any) -> str:
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for unit in ("octets", "Ko", "Mo"):
+        if v < 1024:
+            return f"{v:.0f} {unit}" if unit == "octets" else f"{v:.1f} {unit}"
+        v /= 1024.0
+    return f"{v:.1f} Go"

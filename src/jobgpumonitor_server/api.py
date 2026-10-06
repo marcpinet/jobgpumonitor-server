@@ -13,10 +13,12 @@
 import asyncio
 import gzip
 import hmac
+import io
 import json
 import os
 import re
 import time
+import zlib
 from typing import Any, Dict, List, Optional
 
 from .store import Store
@@ -30,7 +32,8 @@ def append_events(base_dir: str, events: List[Any]) -> "tuple[int, int]":
         for ev in events:
             if not (isinstance(ev, dict) and isinstance(ev.get("run_id"), str) and isinstance(ev.get("emitter"), str)
                     and isinstance(ev.get("type"), str) and isinstance(ev.get("data"), dict)
-                    and _RUN_ID_RE.match(ev["run_id"]) and _EMITTER_RE.match(ev["emitter"])):
+                    and _RUN_ID_RE.match(ev["run_id"]) and _EMITTER_RE.match(ev["emitter"])
+                    and not any(p in (".", "..") for p in [*ev["run_id"].split("/"), ev["emitter"]])):
                 rejected += 1
                 continue
             path = os.path.join(base_dir, "runs", *ev["run_id"].split("/"), ev["emitter"] + ".jsonl")
@@ -64,6 +67,15 @@ def create_app(store: Store, token: str = "", prefix: str = "", ingest_token: st
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[0-9]+$")
 _EMITTER_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _MAX_BODY = 32 * 1024 * 1024
+#: Once decompressed (``jgm forward`` sends at most ~4 MB of JSONL per request; a gzip bomb
+#: inflates ~1000x).
+_MAX_INFLATED = 64 * 1024 * 1024
+
+
+def _gunzip(raw: bytes, limit: int) -> bytes:
+    """Decompress, reading at most ``limit + 1`` bytes: memory stays bounded whatever the ratio."""
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+        return gz.read(limit + 1)
 
 
 def _build_app(store: Store, token: str = "", ingest_token: str = "", ingest_dir: str = "") -> Any:
@@ -93,14 +105,22 @@ def _build_app(store: Store, token: str = "", ingest_token: str = "", ingest_dir
     async def ingest(request: Request) -> Dict[str, Any]:
         """Accept a JSON list of events (optionally gzip-encoded) and append them to the local
         event directory, where the engine picks them up exactly like locally written files."""
+        try:
+            declared = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0
+        if declared > _MAX_BODY:
+            raise HTTPException(status_code=413, detail="body too large")
         raw = await request.body()
         if len(raw) > _MAX_BODY:
             raise HTTPException(status_code=413, detail="body too large")
         if request.headers.get("content-encoding", "").lower() == "gzip":
             try:
-                raw = gzip.decompress(raw)
-            except (OSError, EOFError) as e:
+                raw = _gunzip(raw, _MAX_INFLATED)
+            except (OSError, EOFError, zlib.error) as e:
                 raise HTTPException(status_code=400, detail="bad gzip") from e
+            if len(raw) > _MAX_INFLATED:
+                raise HTTPException(status_code=413, detail="decompressed body too large")
         try:
             events = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
