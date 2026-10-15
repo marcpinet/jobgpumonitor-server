@@ -75,6 +75,36 @@ class Ingestor:
                 break
         return out
 
+    def prune_files(self, older_than_days: int, now: float) -> int:
+        """Delete event files untouched for ``older_than_days`` and fully ingested (their events
+        are past retention too), then the run directories left empty."""
+        if older_than_days <= 0:
+            return 0
+        cutoff = now - older_than_days * 86400
+        removed = 0
+        for path in self.files():
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            offset, _ = self.store.get_offset(path)
+            if st.st_mtime >= cutoff or offset < st.st_size:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            self.store.forget_offset(path)
+            removed += 1
+            d = os.path.dirname(path)
+            for _ in range(3):  # <restart>, <job>, <cluster>
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    break
+                d = os.path.dirname(d)
+        return removed
+
 
 def read_run_events(path_or_dir: str) -> List[Dict[str, Any]]:
     """Every event of a run directory (or one file), ordered by timestamp then sequence."""

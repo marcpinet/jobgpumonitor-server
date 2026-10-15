@@ -7,7 +7,8 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Set
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -33,10 +34,20 @@ CREATE TABLE IF NOT EXISTS logs (
   size INTEGER NOT NULL DEFAULT 0, received INTEGER NOT NULL DEFAULT 0, truncated INTEGER NOT NULL DEFAULT 0,
   eof INTEGER NOT NULL DEFAULT 0, updated_ts REAL NOT NULL, PRIMARY KEY (run_id, stream)
 );
+CREATE TABLE IF NOT EXISTS log_chunks (
+  id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, stream TEXT NOT NULL, text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS log_chunks_stream ON log_chunks(run_id, stream, id);
 """
 
 #: Per stream, keep at most this much text (the head is dropped, a marker is kept).
 LOG_KEEP_BYTES = 4 * 1024 * 1024
+#: Once over the limit, the head is dropped down to this much, so that trimming happens
+#: once per few hundred kilobytes of output rather than on every chunk.
+LOG_TRIM_TO = LOG_KEEP_BYTES * 9 // 10
+#: Completed lines are stored in rows of at most this size (trimming drops whole rows).
+LOG_ROW_MAX = 64 * 1024
+_HEAD_CUT = "[… début tronqué …]\n"
 
 
 class Store:
@@ -50,8 +61,14 @@ class Store:
         with self._lock:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
+            self._db.execute(f"PRAGMA journal_size_limit={8 * 1024 * 1024}")
             self._db.executescript(_SCHEMA)
             self._add_columns("logs", {"emitter": "TEXT"})
+            # logs are append-only rows in log_chunks; ``tail`` is the last, unfinished line
+            # (the only part a carriage return can still redraw), ``stored`` what the rows hold
+            self._add_columns("logs", {"tail": "TEXT NOT NULL DEFAULT ''", "stored": "INTEGER NOT NULL DEFAULT 0",
+                                       "head_cut": "INTEGER NOT NULL DEFAULT 0"})
+            self._migrate_log_text()
             # ingestion time: retention counts from when we received an event, not from when
             # it was emitted (a backlog shipped late must not be dropped as soon as it lands)
             self._add_columns("events", {"ingested_ts": "REAL"})
@@ -63,6 +80,34 @@ class Store:
         for name, decl in cols.items():
             if name not in have:
                 self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    def _migrate_log_text(self) -> None:
+        """Before 0.5.0 each stream was one ``logs.text`` value rewritten whole on every chunk:
+        move it into log_chunks rows."""
+        rows = self._db.execute("SELECT run_id, stream, text FROM logs WHERE text != ''").fetchall()
+        if not rows:
+            return
+        with self.batch():
+            for r in rows:
+                j = r["text"].rfind("\n") + 1
+                stored = self._insert_chunks(r["run_id"], r["stream"], r["text"][:j])
+                self._db.execute("UPDATE logs SET text='', tail=?, stored=? WHERE run_id=? AND stream=?",
+                                 (r["text"][j:], stored, r["run_id"], r["stream"]))
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """One transaction (one disk sync) for everything done inside, instead of one per statement."""
+        with self._lock:
+            if self._db.in_transaction:  # nested: the outer batch commits
+                yield
+                return
+            self._db.execute("BEGIN")
+            try:
+                yield
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+            self._db.execute("COMMIT")
 
     # ------------------------------------------------------------------ runs
 
@@ -165,33 +210,85 @@ class Store:
         text = data.get("text") or ""
         if data.get("skipped"):
             text = f"[… {_human_bytes(data['skipped'])} sautés …]\n" + text
-        with self._lock:
-            row = self._db.execute("SELECT text, received, emitter FROM logs WHERE run_id=? AND stream=?", (run_id, stream)).fetchone()
+        with self.batch():
+            row = self._db.execute("SELECT tail, stored, head_cut, received, emitter FROM logs WHERE run_id=? AND stream=?",
+                                   (run_id, stream)).fetchone()
             if row and row["emitter"] and emitter and row["emitter"] != emitter:
                 return False
-            cur = row["text"] if row else ""
             received = (row["received"] if row else 0) + len(text.encode("utf-8"))
-            new = _append_folded(cur, text)
-            if len(new) > LOG_KEEP_BYTES:
-                cut = new.find("\n", len(new) - LOG_KEEP_BYTES)
-                new = "[… début tronqué …]\n" + new[cut + 1 if cut >= 0 else len(new) - LOG_KEEP_BYTES:]
+            stored = row["stored"] if row else 0
+            head_cut = row["head_cut"] if row else 0
+            # only the unfinished last line can be redrawn: completed lines are appended, never rewritten
+            new = _append_folded(row["tail"] if row else "", text)
+            j = new.rfind("\n") + 1
+            stored += self._insert_chunks(run_id, stream, new[:j])
+            tail = new[j:]
+            if len(tail) > LOG_KEEP_BYTES:  # a monstrous line with no newline
+                tail, head_cut = tail[-LOG_KEEP_BYTES:], 1
+            if stored + len(tail) > LOG_KEEP_BYTES:
+                stored = self._trim_chunks(run_id, stream, stored, LOG_TRIM_TO - len(tail))
+                head_cut = 1
             self._db.execute(
-                "INSERT INTO logs(run_id,stream,path,text,size,received,truncated,eof,updated_ts,emitter) VALUES(?,?,?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(run_id,stream) DO UPDATE SET path=excluded.path, text=excluded.text, size=excluded.size,"
+                "INSERT INTO logs(run_id,stream,path,size,received,truncated,eof,updated_ts,emitter,tail,stored,head_cut)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(run_id,stream) DO UPDATE SET path=excluded.path, size=excluded.size,"
                 " received=excluded.received, truncated=excluded.truncated, eof=excluded.eof, updated_ts=excluded.updated_ts,"
-                " emitter=COALESCE(logs.emitter, excluded.emitter)",
-                (run_id, stream, data.get("path"), new, int(data.get("size") or 0), received,
-                 1 if data.get("truncated") else 0, 1 if data.get("eof") else 0, time.time(), emitter),
+                " emitter=COALESCE(logs.emitter, excluded.emitter), tail=excluded.tail, stored=excluded.stored,"
+                " head_cut=excluded.head_cut",
+                (run_id, stream, data.get("path"), int(data.get("size") or 0), received,
+                 1 if data.get("truncated") else 0, 1 if data.get("eof") else 0, time.time(), emitter,
+                 tail, stored, head_cut),
             )
             return True
+
+    def _insert_chunks(self, run_id: str, stream: str, text: str) -> int:
+        """Append ``text`` as rows of at most LOG_ROW_MAX, cut after a newline when possible."""
+        i = 0
+        while i < len(text):
+            end = min(i + LOG_ROW_MAX, len(text))
+            if end < len(text):
+                nl = text.rfind("\n", i, end)
+                if nl >= i:
+                    end = nl + 1
+            self._db.execute("INSERT INTO log_chunks(run_id,stream,text) VALUES(?,?,?)", (run_id, stream, text[i:end]))
+            i = end
+        return len(text)
+
+    def _trim_chunks(self, run_id: str, stream: str, stored: int, keep: int) -> int:
+        """Drop the oldest rows until at most ``keep`` characters remain. Returns what remains."""
+        drop: List[int] = []
+        for r in self._db.execute("SELECT id, length(text) AS n FROM log_chunks WHERE run_id=? AND stream=? ORDER BY id",
+                                  (run_id, stream)):
+            if stored <= keep:
+                break
+            drop.append(r["id"])
+            stored -= r["n"]
+        for i in range(0, len(drop), 500):
+            part = drop[i:i + 500]
+            self._db.execute(f"DELETE FROM log_chunks WHERE id IN ({','.join('?' * len(part))})", part)
+        return max(stored, 0)
 
     def get_log(self, run_id: str, stream: str, tail: Optional[int] = None) -> Optional[Dict[str, Any]]:
         with self._lock:
             row = self._db.execute("SELECT * FROM logs WHERE run_id=? AND stream=?", (run_id, stream)).fetchone()
-        if not row:
-            return None
-        text = row["text"]
-        cut_head = False
+            if not row:
+                return None
+            parts = [row["tail"]]
+            n = len(row["tail"])
+            complete = True
+            # newest rows first, and only as many as the tail needs
+            cur = self._db.execute("SELECT text FROM log_chunks WHERE run_id=? AND stream=? ORDER BY id DESC", (run_id, stream))
+            for (t,) in cur:
+                if tail and n > tail:
+                    complete = False
+                    break
+                parts.append(t)
+                n += len(t)
+            cur.close()
+        if complete and row["head_cut"]:
+            parts.append(_HEAD_CUT)
+        text = "".join(reversed(parts))
+        cut_head = not complete
         if tail and len(text) > tail:
             text = text[-tail:]
             cut_head = True
@@ -207,8 +304,12 @@ class Store:
     def prune_logs(self, older_than_days: int) -> int:
         if older_than_days <= 0:
             return 0
-        with self._lock:
-            cur = self._db.execute("DELETE FROM logs WHERE updated_ts < ?", (time.time() - older_than_days * 86400,))
+        cutoff = time.time() - older_than_days * 86400
+        with self.batch():
+            self._db.execute(
+                "DELETE FROM log_chunks WHERE EXISTS (SELECT 1 FROM logs l WHERE l.run_id=log_chunks.run_id"
+                " AND l.stream=log_chunks.stream AND l.updated_ts < ?)", (cutoff,))
+            cur = self._db.execute("DELETE FROM logs WHERE updated_ts < ?", (cutoff,))
             return cur.rowcount
 
     # ------------------------------------------------------------------ offsets
@@ -225,6 +326,10 @@ class Store:
                 " offset=excluded.offset, inode=excluded.inode, mtime=excluded.mtime",
                 (path, offset, inode, mtime),
             )
+
+    def forget_offset(self, path: str) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM offsets WHERE path=?", (path,))
 
     def known_paths(self) -> Dict[str, float]:
         with self._lock:

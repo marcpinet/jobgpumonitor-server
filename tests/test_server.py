@@ -565,3 +565,98 @@ def test_log_chunks_fold_redraws_and_mark_skipped_bytes():
     store.append_log("c/1/0", {"stream": "stderr", "text": "Traceback ...\n", "skipped": 3 * 1024 * 1024, "truncated": True})
     text = store.get_log("c/1/0", "stderr")["text"]
     assert text.endswith("next\n[… 3.0 Mo sautés …]\nTraceback ...\n")
+
+
+def test_log_lines_are_appended_not_rewritten():
+    store = Store(":memory:")
+    store.append_log("c/1/0", {"stream": "stdout", "text": "a\nb"})
+    store.append_log("c/1/0", {"stream": "stdout", "text": "c\nd\n"})
+    store.append_log("c/1/0", {"stream": "stdout", "text": "e  1%\r"})
+    rows = [r[0] for r in store._db.execute("SELECT text FROM log_chunks ORDER BY id")]
+    assert rows == ["a\n", "bc\nd\n"]  # the unfinished line stays out of the rows until it ends
+    assert store.get_log("c/1/0", "stdout")["text"] == "a\nbc\nd\ne  1%\r"
+    store.append_log("c/1/0", {"stream": "stdout", "text": "e 100%\n"})
+    assert store.get_log("c/1/0", "stdout")["text"] == "a\nbc\nd\ne 100%\n"
+    # tail reads only the newest rows
+    r = store.get_log("c/1/0", "stdout", tail=7)
+    assert r["text"] == "e 100%\n"[-7:] and r["head_cut"] is True
+    assert store.get_log("c/1/0", "stdout", tail=1000)["head_cut"] is False
+
+
+def test_log_head_is_trimmed_by_whole_rows(monkeypatch):
+    import jobgpumonitor_server.store as st
+
+    monkeypatch.setattr(st, "LOG_KEEP_BYTES", 100)
+    monkeypatch.setattr(st, "LOG_TRIM_TO", 60)
+    monkeypatch.setattr(st, "LOG_ROW_MAX", 20)
+    store = Store(":memory:")
+    for i in range(30):
+        store.append_log("c/1/0", {"stream": "stdout", "text": f"line {i:02d}\n"})
+    doc = store.get_log("c/1/0", "stdout")
+    body = doc["text"]
+    assert body.startswith("[… début tronqué …]\n") and body.endswith("line 29\n")
+    kept = body.split("\n", 1)[1]
+    assert len(kept) <= 100 and kept.startswith("line ")  # cut on a line boundary
+    stored = store._db.execute("SELECT stored FROM logs").fetchone()[0]
+    assert stored == sum(r[0] for r in store._db.execute("SELECT length(text) FROM log_chunks"))
+    # one burst bigger than the limit is split in rows, then trimmed
+    store.append_log("c/1/0", {"stream": "stderr", "text": "".join(f"err {i:03d}\n" for i in range(50))})
+    err = store.get_log("c/1/0", "stderr")["text"]
+    assert err.endswith("err 049\n") and len(err) < 130
+
+
+def test_old_single_text_logs_are_migrated(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    Store(str(db)).close()
+    raw = sqlite3.connect(db)
+    raw.execute("ALTER TABLE logs DROP COLUMN tail")  # as written by 0.4.0
+    raw.execute("INSERT INTO logs(run_id,stream,text,updated_ts) VALUES('c/1/0','stdout','a\nb\nprog 5%\r',1)")
+    raw.commit()
+    raw.close()
+    store = Store(str(db))
+    assert store.get_log("c/1/0", "stdout")["text"] == "a\nb\nprog 5%\r"
+    store.append_log("c/1/0", {"stream": "stdout", "text": "prog 9%\ndone\n"})
+    assert store.get_log("c/1/0", "stdout")["text"] == "a\nb\nprog 9%\ndone\n"
+    assert store._db.execute("SELECT text FROM logs").fetchone()[0] == ""
+    store._db.execute("UPDATE logs SET updated_ts=1")
+    store.prune_logs(1)
+    assert store.get_log("c/1/0", "stdout") is None
+    assert store._db.execute("SELECT COUNT(*) FROM log_chunks").fetchone()[0] == 0
+
+
+def test_old_ingested_files_are_pruned(tmp_path):
+    base = tmp_path / "ev"
+    eng = Engine(Config(dirs=[str(base)], db=":memory:"), notifiers=[])
+    write_events(base, "c/1/0", "process-r0-h-1.jsonl", [env("run.heartbeat", {})])
+    write_events(base, "c/2/0", "process-r0-h-1.jsonl", [env("run.heartbeat", {}, run_id="c/2/0")])
+    eng.cycle()
+    old = time.time() - 40 * 86400
+    f1 = base / "runs" / "c" / "1" / "0" / "process-r0-h-1.jsonl"
+    os.utime(f1, (old, old))
+    # an old file not fully read yet is kept
+    f2 = base / "runs" / "c" / "2" / "0" / "process-r0-h-1.jsonl"
+    with open(f2, "a") as f:
+        f.write(json.dumps(env("run.heartbeat", {}, run_id="c/2/0", seq=1)) + "\n")
+    os.utime(f2, (old, old))
+    assert eng.ingestor.prune_files(30, time.time()) == 1
+    assert not (base / "runs" / "c" / "1").exists() and f2.exists() and (base / "runs").exists()
+    assert str(f1) not in eng.store.known_paths()
+
+
+def test_a_failed_cycle_rolls_back_offsets(tmp_path, monkeypatch):
+    base = tmp_path / "ev"
+    eng = Engine(Config(dirs=[str(base)], db=":memory:"), notifiers=[])
+    write_events(base, "c/1/0", "process-r0-h-1.jsonl", [env("run.start", {"host": "h", "start_ts": 1.0})])
+
+    def boom(run):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(eng.store, "upsert_run", boom)
+    with pytest.raises(RuntimeError):
+        eng.cycle()
+    monkeypatch.undo()
+    assert eng.store.get_run("c/1/0") is None
+    eng.cycle()  # the events are read again, not lost
+    assert eng.store.get_run("c/1/0")["phase"] == "running"

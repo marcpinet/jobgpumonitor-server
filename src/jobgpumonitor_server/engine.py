@@ -72,27 +72,36 @@ class Engine:
         """One pass. Returns counters (for ``--once`` and tests)."""
         now = now or time.time()
         self.cycles += 1
-        batch = self.ingestor.scan()
         changed: Dict[str, List[str]] = {}
-        for run_id, env in batch:
-            if env.get("type") == "log.chunk":
-                # the text goes to the logs table; the events table only keeps a light record
-                data = env.get("data") or {}
-                light = dict(env, data={k: v for k, v in data.items() if k != "text"})
-                if not self.store.add_event(run_id, light):
-                    continue
-                self.store.append_log(run_id, data, env.get("emitter"))
-            elif not self.store.add_event(run_id, env):
-                continue  # duplicate
-            run = self._run(run_id)
-            changes = apply(run, env)
-            self.ingested += 1
-            changed.setdefault(run_id, []).extend(changes)
-        for run_id, changes in changed.items():
-            run = self._run(run_id)
-            sent = self.store.alert_keys(run_id)
-            alerts = evaluate(run, changes, self.cfg.alerts, sent)
-            self.store.upsert_run(run)
+        to_send: List[tuple] = []
+        try:
+            # one transaction for the whole batch: offsets, events, logs and runs land together
+            # (and the SD card sees one sync per cycle instead of one per event)
+            with self.store.batch():
+                batch = self.ingestor.scan()
+                for run_id, env in batch:
+                    if env.get("type") == "log.chunk":
+                        # the text goes to the logs table; the events table only keeps a light record
+                        data = env.get("data") or {}
+                        light = dict(env, data={k: v for k, v in data.items() if k != "text"})
+                        if not self.store.add_event(run_id, light):
+                            continue
+                        self.store.append_log(run_id, data, env.get("emitter"))
+                    elif not self.store.add_event(run_id, env):
+                        continue  # duplicate
+                    run = self._run(run_id)
+                    changes = apply(run, env)
+                    self.ingested += 1
+                    changed.setdefault(run_id, []).extend(changes)
+                for run_id, changes in changed.items():
+                    run = self._run(run_id)
+                    sent = self.store.alert_keys(run_id)
+                    to_send.append((run, evaluate(run, changes, self.cfg.alerts, sent)))
+                    self.store.upsert_run(run)
+        except Exception:
+            self._cache.clear()  # the cached documents may hold changes that were rolled back
+            raise
+        for run, alerts in to_send:  # network calls: outside the transaction
             self._notify(run, alerts, now)
         # time-based rules on active runs, plus recently ended ones still waiting for the scheduler
         fresh = self.store.cluster_freshness()
@@ -111,6 +120,7 @@ class Engine:
             self._last_prune = now
             self.store.prune_events(self.cfg.keep_events_days)
             self.store.prune_logs(self.cfg.keep_events_days)
+            self.ingestor.prune_files(self.cfg.keep_events_days, now)
         return {"events": len(batch), "runs_changed": len(changed), "alerts": self.alerts_sent}
 
     def run_forever(self, stop=None) -> None:  # type: ignore[no-untyped-def]
